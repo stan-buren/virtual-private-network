@@ -102,9 +102,9 @@ async def deploy(version: str | None = None) -> str:
     if version is None:
         version = "latest"
 
-    # Push latest compose.yml so Asus always has devices + volumes
+    # Push latest compose.yml + .env so Asus has fresh config + credentials
     subprocess.run(
-        ["scp", "compose.yml", "donald_trump@192.168.0.131:/opt/vpn/compose.yml"],
+        ["scp", "compose.yml", ".env", "donald_trump@192.168.0.131:/opt/vpn/"],
         check=True,
     )
 

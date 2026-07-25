@@ -9,6 +9,8 @@ services:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - /opt/vpn/cache:/app/cache
+    env_file:
+      - .env
     restart: unless-stopped
     logging:
       driver: syslog
