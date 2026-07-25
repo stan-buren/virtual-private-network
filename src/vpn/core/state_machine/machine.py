@@ -36,6 +36,7 @@ class VpnStateMachine:
         vpn_routes_cfg: Any = None,
         dns_resolver: Any = None,
         paths: dict[str, str] | None = None,
+        notifier: Any = None,
     ) -> None:
         self.context = RuntimeContext()
         self._event_queue: asyncio.Queue[VpnEvent] = asyncio.Queue()
@@ -50,6 +51,7 @@ class VpnStateMachine:
         self._bypass_cfg = bypass_cfg
         self._vpn_routes_cfg = vpn_routes_cfg
         self._dns_resolver = dns_resolver
+        self._notifier = notifier
         self._paths = paths or {}
         self._ipc_server: asyncio.AbstractServer | None = None
 

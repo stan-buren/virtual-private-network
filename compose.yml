@@ -12,9 +12,3 @@ services:
     env_file:
       - .env
     restart: unless-stopped
-    logging:
-      driver: syslog
-      options:
-        syslog-address: "tcp://${SYSLOG_HOST:-192.168.0.93}:514"
-        syslog-facility: "local0"
-        tag: "vpn"

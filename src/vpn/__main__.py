@@ -144,6 +144,7 @@ async def _main() -> None:
         vpn_routes_cfg=vpn_routes_cfg,
         dns_resolver=dns_resolver,
         paths=paths,
+        notifier=telegram,
     )
     ctx = machine.context
     events = machine._event_queue

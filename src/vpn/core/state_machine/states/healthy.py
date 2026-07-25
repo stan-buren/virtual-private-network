@@ -20,6 +20,10 @@ class HealthyState(VpnState):
     async def on_enter(self) -> None:
         logger.info("Entering HEALTHY state — VPN tunnel operational")
         self.ctx.fail_streak = 0
+        notifier = self.machine._notifier
+        if notifier:
+            await notifier.send("🟢 VPN daemon started. Server: %s, Gateway: %s" % (
+                self.ctx.active_server or "unknown", self.ctx.gateway or "unknown"))
 
     async def on_exit(self) -> None:
         pass
