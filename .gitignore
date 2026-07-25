@@ -26,8 +26,8 @@ __pycache__/
 .venv/
 
 # --- Binaries / 3rd-party AppImage extracts ---
+bin/
 squashfs-root/
-*.AppImage
 
 # --- Temp / backup / test files ---
 vpn_daemon--bak.py

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -30,6 +30,7 @@ def _mock_orch(**overrides):
         "notifier": MagicMock(),
         "ru_updater": MagicMock(run_forever=AsyncMock()),
         "shell": MagicMock(),
+        "subprocess": MagicMock(),
         "app_cfg": MagicMock(table_id="100"),
         "net_cfg": MagicMock(dns_servers=[], lan_subnets=[]),
         "tunnel_cfg": MagicMock(socks5_host="127.0.0.1", socks5_port=3066),
@@ -41,25 +42,34 @@ def _mock_orch(**overrides):
     return VpnOrchestrator(**defaults)
 
 
-class TestOrchestrator:
+class TestOrchestratorBootstrap:
+    """Tests for VpnOrchestrator.bootstrap() with _watch_process patched.
+
+    _watch_process is patched out because it creates a background asyncio
+    task that monitors the sing-box subprocess handle. Mocked subprocess
+    handles can cause _watch_process to post SINGBOX_DIED immediately,
+    racing with the BOOTSTRAP_DONE event posted at the end of bootstrap().
+    We test the bootstrap SEQUENCE, not process monitoring.
+    """
+
     @pytest.mark.asyncio
     async def test_bootstrap_posts_bootstrap_done(self) -> None:
-        """Verify BOOTSTRAP_DONE event is posted after bootstrap."""
         ctx = RuntimeContext()
         events: asyncio.Queue[VpnEvent] = asyncio.Queue()
-        orch = _mock_orch()
-        await orch.bootstrap(ctx, events)
+        with patch.object(VpnOrchestrator, "_watch_process", new_callable=AsyncMock):
+            orch = _mock_orch()
+            await orch.bootstrap(ctx, events)
         event = events.get_nowait()
         assert event.type == EventType.BOOTSTRAP_DONE
 
     @pytest.mark.asyncio
     async def test_bootstrap_populates_context(self) -> None:
-        """Verify gateway and interface are set in RuntimeContext."""
         ctx = RuntimeContext()
         events: asyncio.Queue[VpnEvent] = asyncio.Queue()
         mock_topo = MagicMock()
         mock_topo.discover.return_value = MagicMock(gateway="10.0.0.1", interface="eth0")
-        orch = _mock_orch(topology_discovery=mock_topo)
-        await orch.bootstrap(ctx, events)
+        with patch.object(VpnOrchestrator, "_watch_process", new_callable=AsyncMock):
+            orch = _mock_orch(topology_discovery=mock_topo)
+            await orch.bootstrap(ctx, events)
         assert ctx.gateway == "10.0.0.1"
         assert ctx.interface == "eth0"

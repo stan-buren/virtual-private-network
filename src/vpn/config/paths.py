@@ -2,6 +2,11 @@
 
 Reads config/paths.yaml and exposes every path as a module-level constant
 resolved relative to PROJECT_ROOT. All other modules import paths from here.
+
+Resolution strategy (three-tier fallback):
+1. PROJECT_ROOT env var (Docker/container runtime)
+2. .project_root marker file (walks up from this file's location)
+3. Static parent lookup (3 levels up from src/vpn/config/)
 """
 
 from __future__ import annotations
@@ -14,31 +19,35 @@ import yaml
 
 
 def _find_project_root() -> Path:
-    """Locates the project root by searching for config/paths.yaml upward.
+    """Locate the project root directory deterministically.
+
+    Three-tier fallback strategy:
+    1. ``PROJECT_ROOT`` environment variable — takes precedence in
+       Docker and production deployments.
+    2. ``.project_root`` marker file — walks upward from this file's
+       resolved location; first parent with ``.project_root`` wins.
+    3. Static parent lookup — ``parents[3]`` from this file
+       (``src/vpn/config/paths.py`` → ``src/`` → project root).
 
     Returns:
         Path: The absolute project root directory.
 
     Raises:
-        FileNotFoundError: If config/paths.yaml cannot be found.
+        FileNotFoundError: If no strategy resolves a valid root.
     """
-    # Check env var first (set by Dockerfile / container runtime)
-    env_root = os.environ.get("PROJECT_ROOT", "")
-    if env_root:
-        candidate = Path(env_root) / "config" / "paths.yaml"
-        if candidate.exists():
-            return Path(env_root)
-    # Fallback: walk up from this file's location
-    current = Path(__file__).resolve().parent
-    for _ in range(10):
-        candidate = current / "config" / "paths.yaml"
-        if candidate.exists():
-            return current
-        if current.parent == current:
-            break
-    raise FileNotFoundError(
-        "Cannot locate project root: config/paths.yaml not found in any parent directory."
-    )
+    # Tier 1: Environment variable (Docker, Airflow, CI)
+    if env_root := os.getenv("PROJECT_ROOT"):
+        return Path(env_root)
+
+    # Tier 2: .project_root marker file
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / ".project_root").exists():
+            return parent
+
+    # Tier 3: Static parent lookup
+    # This file is at src/vpn/config/paths.py → 3 levels up = project root
+    return current.parents[3]
 
 
 PROJECT_ROOT: Path = _find_project_root()

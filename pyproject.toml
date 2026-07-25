@@ -26,6 +26,8 @@ dev = [
     "pytest-cov>=7.0",
     "pytest-mock>=3.15",
     "pytest-asyncio>=1.0",
+    "dagger-io>=0.18",
+    "anyio>=4.0",
 ]
 
 [tool.pytest.ini_options]
