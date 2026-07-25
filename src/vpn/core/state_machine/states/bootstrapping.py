@@ -24,10 +24,16 @@ class BootstrappingState(VpnState):
     async def on_enter(self) -> None:
         logger.info("Entering BOOTSTRAPPING state")
         self._timeout_task = asyncio.create_task(self._on_timeout())
-        # Trigger bootstrap via orchestrator
+        # Trigger bootstrap via orchestrator (crash-guarded)
         orch = self.machine._orchestrator
         events = self.machine._event_queue
-        asyncio.create_task(orch.bootstrap(self.ctx, events))
+        async def _run():
+            try:
+                await orch.bootstrap(self.ctx, events)
+            except Exception:
+                logger.exception("Bootstrap crashed")
+                await events.put(VpnEvent(EventType.SINGBOX_DIED))
+        asyncio.create_task(_run())
 
     async def on_exit(self) -> None:
         if self._timeout_task:
