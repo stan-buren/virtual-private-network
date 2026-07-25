@@ -123,6 +123,7 @@ async def _main() -> None:
         notifier=telegram,
         ru_updater=ru_updater,
         shell=shell,
+        subprocess=subproc,
         app_cfg=app_cfg,
         net_cfg=net_cfg,
         tunnel_cfg=tunnel_cfg,
@@ -132,12 +133,27 @@ async def _main() -> None:
     )
 
     # ── Create state machine ──────────────────────────────────────────────
-    machine = VpnStateMachine(BootstrappingState)
+    machine = VpnStateMachine(
+        BootstrappingState,
+        provider=provider,
+        switcher=server_switcher,
+        resolver=server_ip_resolver,
+        rules=rules,
+        shell=shell,
+        bypass_cfg=bypass_cfg,
+        paths=paths,
+    )
     ctx = machine.context
     events = machine._event_queue
-
-    # ── Bootstrap via orchestrator (background task) ──────────────────────
-    asyncio.create_task(orchestrator.bootstrap(ctx, events))
+    async def _bootstrap_wrapper():
+        try:
+            await orchestrator.bootstrap(ctx, events)
+        except Exception:
+            logger.exception("Bootstrap crashed")
+            await events.put(VpnEvent(EventType.SINGBOX_DIED))
+    machine._orchestrator = orchestrator
+    # Bootstrap via orchestrator (background task, crash-guarded)
+    asyncio.create_task(_bootstrap_wrapper())
 
     # ── Start signal handlers ─────────────────────────────────────────────
     loop = asyncio.get_running_loop()

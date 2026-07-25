@@ -14,8 +14,8 @@ from vpn.core.events import EventType, VpnEvent
 from vpn.core.firewall.mss import MssClamp
 from vpn.core.firewall.nat import NatManager
 from vpn.core.firewall.sysctl import SysctlManager
-from vpn.core.notification.telegram import TelegramNotifier
-from vpn.core.ports import ShellPort, VpnProviderPort
+from vpn.core.ports import ShellPort, SubprocessPort, VpnProviderPort
+from vpn.logger.exceptions import VpnConnectionError
 from vpn.core.routing.bypass_loader import BypassLoader
 from vpn.core.routing.route_table import RouteTable
 from vpn.core.routing.rule_manager import PRIO_DNS_START, PRIO_LAN_START, RuleManager
@@ -59,6 +59,7 @@ class VpnOrchestrator:
         notifier: TelegramNotifier,
         ru_updater: RuSubnetUpdater,
         shell: ShellPort,
+        subprocess: SubprocessPort,
         app_cfg: AppConfig,
         net_cfg: NetworkConfig,
         tunnel_cfg: TunnelConfig,
@@ -87,33 +88,43 @@ class VpnOrchestrator:
         self._bypass_cfg = bypass_cfg
         self._vpn_routes_cfg = vpn_routes_cfg
         self._paths = paths
-        self._ru_updater_task: asyncio.Task[None] | None = None
-
+        self._subprocess = subprocess
     async def bootstrap(self, ctx: RuntimeContext, events: asyncio.Queue[VpnEvent]) -> None:
         """Execute the full bootstrap sequence.
 
         Steps:
             1. Deploy sing-box config
-            2. Discover network topology
-            3. Configure routing (TUN, server/DNS/LAN bypasses, route table)
-            4. Apply firewall rules (NAT, MSS, sysctl)
-            5. Start tunnel and background tasks
-            6. Post BOOTSTRAP_DONE event
+            2. Start sing-box + wait for SOCKS5 port
+            3. Discover network topology
+            4. Configure routing (TUN, bypasses, route table)
+            5. Apply firewall rules (NAT, MSS, sysctl)
+            6. Start tunnel and background tasks
+            7. Post BOOTSTRAP_DONE event
         """
         logger.info("=== VPN Bootstrap Sequence ===")
 
         # 1. Deploy config
-        logger.info("[1/6] Deploying sing-box configuration")
+        logger.info("[1/7] Deploying sing-box configuration")
         self._deployer.deploy()
 
-        # 2. Discover topology
-        logger.info("[2/6] Discovering network topology")
+        # 2. Start sing-box (no port-wait — _watch_process catches failures)
+        logger.info("[2/7] Starting sing-box process")
+        ctx.singbox = self._subprocess.popen([
+            "sing-box", "run",
+            "-c", "/etc/sing-box/config.json",
+            "-D", "/var/lib/sing-box",
+        ])
+        asyncio.create_task(
+            self._watch_process(ctx.singbox, events, VpnEvent(EventType.SINGBOX_DIED))
+        )
+        logger.debug("[2/7] sing-box process launched, proceeding to topology")
         topology = self._topology_discovery.discover()
         ctx.gateway = topology.gateway
         ctx.interface = topology.interface
+        await asyncio.sleep(0)  # Yield
 
-        # 3. Routing
-        logger.info("[3/6] Configuring routing")
+        # 4. Routing
+        logger.info("[4/7] Configuring routing")
         self._tun.create()
 
         profile_path = self._paths.get("profile_keys", "")
@@ -141,19 +152,20 @@ class VpnOrchestrator:
             table_id=self._app_cfg.table_id,
         )
         self._route_table.load_batch(routes, self._app_cfg.table_id)
-        self._rules.add_torrent_bypass()
         self._rules.add_catchall(self._app_cfg.table_id)
         self._route_table.set_default(self._app_cfg.table_id)
+        self._rules.add_torrent_bypass()
+        await asyncio.sleep(0)  # Yield
 
-        # 4. Firewall
-        logger.info("[4/6] Applying firewall rules")
+        # 5. Firewall
+        logger.info("[5/7] Applying firewall rules")
         self._nat.apply(topology.interface)
         self._mss.apply()
         self._sysctl_mgr.enable_ip_forward()
         self._sysctl_mgr.disable_ipv6_wan()
 
-        # 5. Start tunnel + background tasks
-        logger.info("[5/6] Starting tunnel and background tasks")
+        # 6. Start tunnel + background tasks
+        logger.info("[6/7] Starting tunnel and background tasks")
         proxy_url = "socks5://%s:%d" % (self._tunnel_cfg.socks5_host, self._tunnel_cfg.socks5_port)
         ctx.tun2socks = self._tun2socks.start(proxy_url)
         ctx.startup_time = time.time()
@@ -161,6 +173,20 @@ class VpnOrchestrator:
         ctx.active_server = servers[0].name if servers else "unknown"
         self._ru_updater_task = asyncio.create_task(self._ru_updater.run_forever())
 
-        # 6. Signal done
-        logger.info("[6/6] Bootstrap complete — posting BOOTSTRAP_DONE")
+        # 7. Signal done
+        logger.info("[7/7] Bootstrap complete — posting BOOTSTRAP_DONE")
         await events.put(VpnEvent(EventType.BOOTSTRAP_DONE))
+
+
+    async def _watch_process(
+        self, handle: PopenHandle, events: asyncio.Queue[VpnEvent], event: VpnEvent
+    ) -> None:
+        """Monitor a subprocess and post an event when it exits.
+
+        Uses run_in_executor to avoid blocking the asyncio event loop
+        on the synchronous subprocess.wait() call.
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, handle.wait, None)
+        logger.warning("Process PID %d exited", handle.pid)
+        await events.put(event)

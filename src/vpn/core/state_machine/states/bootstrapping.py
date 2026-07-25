@@ -24,8 +24,8 @@ class BootstrappingState(VpnState):
     async def on_enter(self) -> None:
         logger.info("Entering BOOTSTRAPPING state")
         self._timeout_task = asyncio.create_task(self._on_timeout())
-        # Bootstrap sequence is triggered by the orchestrator, not here.
-        # The machine waits for BOOTSTRAP_DONE event.
+        # Bootstrap triggered externally by __main__.py
+        pass
 
     async def on_exit(self) -> None:
         if self._timeout_task:
@@ -42,13 +42,17 @@ class BootstrappingState(VpnState):
             await self.transition_to(
                 __import__("vpn.core.state_machine.states.failed", fromlist=["FailedState"]).FailedState
             )
+        elif event.type == EventType.SINGBOX_DIED:
+            logger.error("sing-box died during bootstrap — transitioning to RESTARTING")
+            await self.transition_to(
+                __import__("vpn.core.state_machine.states.restarting", fromlist=["RestartingState"]).RestartingState
+            )
         elif event.type == EventType.TIMEOUT:
             self.ctx.last_error = "Bootstrap timed out after %ds" % BOOTSTRAP_TIMEOUT
             logger.error(self.ctx.last_error)
             await self.transition_to(
                 __import__("vpn.core.state_machine.states.failed", fromlist=["FailedState"]).FailedState
             )
-
     async def _on_timeout(self) -> None:
         await asyncio.sleep(BOOTSTRAP_TIMEOUT)
         await self.machine.post(VpnEvent(type=EventType.TIMEOUT))

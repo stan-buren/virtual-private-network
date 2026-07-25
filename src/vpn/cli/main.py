@@ -1,8 +1,13 @@
-"""VPN CLI entry point — Click group for server, status, logs, and bypass commands."""
+"""VPN CLI entry point — Click group for server, status, and bypass commands.
+
+Communicates with the daemon via JSON-RPC over Unix socket (/var/run/vpn.sock).
+"""
 
 from __future__ import annotations
 
 import click
+
+from vpn.cli.ipc import call as ipc_call
 
 
 @click.group()
@@ -10,6 +15,8 @@ import click
 def cli() -> None:
     """VPN Orchestrator — manage sing-box tunnels, routing, and health."""
 
+
+# ── server ───────────────────────────────────────────────────────────────────
 
 @cli.group()
 def server() -> None:
@@ -19,39 +26,48 @@ def server() -> None:
 @server.command("list")
 def server_list() -> None:
     """List all available VPN servers."""
-    click.echo("Server list (CLI stub — daemon connection required)")
+    servers = ipc_call("server.list")
+    click.echo(f"{'Name':20} {'Country':5} {'Host':18} {'Port':5}")
+    click.echo("-" * 50)
+    for s in servers:
+        click.echo(f"{s['name']:20} {s['country']:5} {s['host']:18} {s['port']:<5}")
 
 
 @server.command("current")
 def server_current() -> None:
     """Show the currently active VPN server."""
-    click.echo("Current server (CLI stub — daemon connection required)")
+    result = ipc_call("server.current")
+    click.echo(result)
 
 
 @server.command("change")
-@click.option("--name", "-n", required=True, help="Server short name (e.g. barguzin)")
+@click.argument("name", required=True)
 def server_change(name: str) -> None:
-    """Switch to a different VPN server."""
-    click.echo("Switching to server: %s (CLI stub — daemon connection required)" % name)
+    """Switch to a different VPN server. Usage: vpn server change barguzin"""
+    result = ipc_call("server.change", {"name": name})
+    click.echo(f"Switched to: {result}")
 
+
+# ── status ───────────────────────────────────────────────────────────────────
 
 @cli.command()
 def status() -> None:
     """Show current daemon status."""
-    click.echo("VPN status (CLI stub — daemon connection required)")
+    result = ipc_call("status")
+    for k, v in result.items():
+        click.echo(f"{k}: {v}")
 
+
+# ── restart ──────────────────────────────────────────────────────────────────
 
 @cli.command()
 def restart() -> None:
     """Force a full daemon restart."""
-    click.echo("Restarting (CLI stub — daemon connection required)")
+    result = ipc_call("restart")
+    click.echo(result.get("status", "ok"))
 
 
-@cli.command()
-def emergency_reset() -> None:
-    """Emergency reset: wipe all rules, routes, tun0."""
-    click.echo("Emergency reset (CLI stub — daemon connection required)")
-
+# ── bypass ───────────────────────────────────────────────────────────────────
 
 @cli.group()
 def bypass() -> None:
@@ -60,26 +76,34 @@ def bypass() -> None:
 
 @bypass.command("list")
 def bypass_list() -> None:
-    """Show current bypass list."""
-    click.echo("Bypass list (CLI stub — daemon connection required)")
+    """Show current bypass domains."""
+    domains = ipc_call("bypass.list")
+    for d in domains:
+        click.echo(d)
 
 
 @bypass.command("add")
-@click.option("--domain", "-d", help="Domain to bypass VPN")
-@click.option("--subnet", "-s", help="CIDR subnet to bypass VPN")
-def bypass_add(domain: str | None, subnet: str | None) -> None:
-    """Add a domain or subnet to the bypass list."""
-    target = domain or subnet
-    click.echo("Adding to bypass: %s (CLI stub — daemon connection required)" % target)
+@click.option("--domain", "-d", required=True, help="Domain to bypass VPN")
+def bypass_add(domain: str) -> None:
+    """Add a domain to the bypass list."""
+    result = ipc_call("bypass.add", {"domain": domain})
+    click.echo(f"Bypass list now: {result}")
 
 
 @bypass.command("remove")
-@click.option("--domain", "-d", help="Domain to remove")
-@click.option("--subnet", "-s", help="CIDR subnet to remove")
-def bypass_remove(domain: str | None, subnet: str | None) -> None:
-    """Remove a domain or subnet from the bypass list."""
-    target = domain or subnet
-    click.echo("Removing from bypass: %s (CLI stub — daemon connection required)" % target)
+@click.option("--domain", "-d", required=True, help="Domain to remove")
+def bypass_remove(domain: str) -> None:
+    """Remove a domain from the bypass list."""
+    result = ipc_call("bypass.remove", {"domain": domain})
+    click.echo(f"Bypass list now: {result}")
+
+
+# ── emergency-reset ──────────────────────────────────────────────────────────
+
+@cli.command()
+def emergency_reset() -> None:
+    """Emergency reset: wipe all rules, routes, tun0. Use with caution."""
+    click.echo("Emergency reset — not yet implemented via IPC. Run locally if needed.")
 
 
 if __name__ == "__main__":

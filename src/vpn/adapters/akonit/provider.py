@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import logging
 from typing import Any
 
@@ -11,49 +12,19 @@ from vpn.core.ports import ServerInfo, VpnProviderPort
 
 logger = logging.getLogger("vpn")
 
-SINGBOX_TEMPLATE: dict[str, Any] = {
-    "log": {"level": "info", "timestamp": True},
-    "inbounds": [
-        {
-            "type": "mixed",
-            "tag": "mixed-in",
-            "listen": "0.0.0.0",
-            "listen_port": 12334,
-            "sniff": True,
-            "sniff_override_destination": True,
-        }
-    ],
-    "outbounds": [
-        {"type": "direct", "tag": "direct-out"},
-    ],
-    "route": {
-        "rules": [
-            {"protocol": "dns", "action": "hijack-dns"},
-            {"ip_is_private": True, "outbound": "direct-out"},
-        ],
-        "final": "vless-out",
-        "auto_detect_interface": True,
-    },
-    "dns": {
-        "servers": [
-            {
-                "tag": "dns-remote",
-                "address": "https://1.1.1.1/dns-query",
-                "detour": "vless-out",
-            },
-            {
-                "tag": "dns-local",
-                "address": "8.8.8.8",
-                "detour": "direct-out",
-            },
-        ],
-        "rules": [
-            {"outbound": "any", "server": "dns-local"},
-            {"query_type": ["A", "AAAA"], "server": "dns-remote"},
-        ],
-        "strategy": "ipv4_only",
-    },
-}
+_EMOJI_RE = re.compile(
+    "[\U0001F1E0-\U0001F1FF"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F900-\U0001F9FF"
+    "\U00002600-\U000027BF"
+    "\U0000200D\U0000FE0F"
+    "\U000000A9\U000000AE"
+    "\u2800-\u28FF"
+    "]+"
+)
+
 
 
 class AkonitProvider:
@@ -63,6 +34,13 @@ class AkonitProvider:
     and the server registry (config/servers.yaml).  Matches CLI-friendly names from the
     registry to outbound entries in the profile by substring-matching the provider tag.
     """
+
+    @staticmethod
+    def _normalize_tag(tag: str) -> str:
+        """Strip emoji, '(Без рекламы)', and collapse whitespace from a tag."""
+        tag = _EMOJI_RE.sub("", tag)
+        tag = tag.replace("(Без рекламы)", "")
+        return " ".join(tag.split()).strip()
 
     def __init__(self, profile_path: str) -> None:
         """Initialise the provider with the path to the sing-box profile JSON.
@@ -84,17 +62,19 @@ class AkonitProvider:
     def _find_outbound(self, tag_substring: str) -> dict[str, Any] | None:
         """Return the first outbound whose ``tag`` contains *tag_substring*.
 
+        Both sides are normalized (emoji stripped) before comparison.
+
         Args:
             tag_substring: The provider tag (from servers.yaml) to match against
-                outbound ``"tag"`` fields.  Matching is case-sensitive substring.
+                outbound ``"tag"`` fields.
 
         Returns:
             The matching outbound dict, or ``None`` if no outbound matches.
         """
+        norm_sub = self._normalize_tag(tag_substring)
         profile = self._load_profile()
         for outbound in profile.get("outbounds", []):
-            obj_tag: str = outbound.get("tag", "")
-            if tag_substring in obj_tag:
+            if norm_sub in self._normalize_tag(outbound.get("tag", "")):
                 return outbound
         return None
 
@@ -150,48 +130,45 @@ class AkonitProvider:
         )
 
     def build_singbox_config(self, server_name: str) -> str:
-        """Assemble a complete sing-box ``config.json`` for *server_name*.
+        """Return a sing-box config.json with *server_name* as the active outbound.
 
-        Takes the :attr:`SINGBOX_TEMPLATE`, inserts the VLESS Reality outbound
-        from the profile as the active outbound (tagged ``"vless-out"``), and
-        returns the resulting JSON string.
+        Loads the provider profile (SSOT), sets ``urltest_out.default`` to the
+        matching outbound tag, sanitizes, and returns the JSON string.
 
         Args:
-            server_name: Short CLI name of the target server.
+            server_name: Short CLI name of the target server (e.g. 'barguzin').
 
         Returns:
-            Pretty-printed (indent 2) JSON string ready to write to disk.
+            Pretty-printed JSON string with the selected server active.
 
         Raises:
-            KeyError: If *server_name* is unknown or its outbound is not found.
+            KeyError: If *server_name* is unknown.
         """
-        server = self.get_server(server_name)
-        outbound = self._find_outbound(self._servers_config.servers[server_name].tag)
-        if outbound is None:
-            raise KeyError("Outbound not found for server: %s" % server_name)
+        config = self._load_profile()
+        raw_tag: str = self._servers_config.servers[server_name].tag
+        norm_sub = self._normalize_tag(raw_tag)
 
-        # Clone so we don't mutate the cached profile data.
-        outbound_copy = dict(outbound)
-        outbound_copy["tag"] = "vless-out"
+        # Find the real outbound tag by normalized substring match
+        target: str | None = None
+        for ob in config.get("outbounds", []):
+            if norm_sub in self._normalize_tag(ob.get("tag", "")):
+                target = ob["tag"]
+                break
+        if target is None:
+            raise KeyError("Server %r not found in profile" % server_name)
 
-        config: dict[str, Any] = json.loads(json.dumps(SINGBOX_TEMPLATE))
-        config["outbounds"].insert(0, outbound_copy)
+        # Replace urltest_out with chosen server tag in all route rules
+        for rule in config.get("route", {}).get("rules", []):
+            if rule.get("outbound") == "urltest_out":
+                rule["outbound"] = target
+        if config.get("route", {}).get("final") == "urltest_out":
+            config["route"]["final"] = target
 
-        return json.dumps(config, indent=2)
+        sanitized = self.sanitize_config(config)
+        return json.dumps(sanitized, indent=2)
 
     def sanitize_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        """Remove or rewrite sing-box fields unsupported by the current runtime.
-
-        The profile JSON may contain fields (e.g. ``experimental.statistics``,
-        batch DNS servers, ``"default"`` on selectors, remote rule-set ``"path"``)
-        that older sing-box releases reject.  This method cleans them in-place.
-
-        Args:
-            raw: The raw dict parsed from the profile JSON.
-
-        Returns:
-            The sanitised dict (same object, mutated).
-        """
+        """Remove or rewrite sing-box fields unsupported by the current runtime."""
         # Remove experimental.statistics
         experimental: dict[str, Any] = raw.get("experimental", {})
         if "statistics" in experimental:
@@ -229,15 +206,45 @@ class AkonitProvider:
         for rule in raw.get("route", {}).get("rules", []):
             rule.pop("name", None)
 
+        # Normalize all outbound tags (strip emoji suffixes from Akonit)
+        for outbound in raw.get("outbounds", []):
+            tag = outbound.get("tag", "")
+            normalized = self._normalize_tag(tag)
+            if normalized != tag:
+                outbound["tag"] = normalized
+                logger.info("Sanitized: normalized tag %r -> %r", tag, normalized)
+
+        # Normalize route.final to match normalized outbound tags
+        if "route" in raw and raw["route"].get("final"):
+            raw["route"]["final"] = self._normalize_tag(raw["route"]["final"])
+
+        # Normalize outbound references in route rules
+        for rule in raw.get("route", {}).get("rules", []):
+            ob = rule.get("outbound", "")
+            if ob and ob != "urltest_out":
+                rule["outbound"] = self._normalize_tag(ob)
+
         # Remove unsupported 'default' from urltest/selector outbounds
         for outbound in raw.get("outbounds", []):
             out_type: str | None = outbound.get("type")
             if out_type in ("urltest", "selector", "url-test"):
                 outbound.pop("default", None)
 
-        # Remove unsupported 'path' from remote rule_sets
+        # Convert remote rule_sets to local when .srs cache exists.
+        # This prevents sing-box from trying to download geoip/geosite at startup
+        # when the VPN isn't up yet (chicken-and-egg problem).
+        import os
         for rset in raw.get("route", {}).get("rule_set", []):
             if rset.get("type") == "remote":
-                rset.pop("path", None)
+                tag: str = rset.get("tag", "")
+                cache_path: str = "/var/lib/sing-box/%s.srs" % tag.replace(":", "-")
+                if os.path.exists(cache_path):
+                    rset["type"] = "local"
+                    rset["path"] = cache_path
+                    rset.pop("url", None)
+                    rset.pop("download_detour", None)
+                    rset.pop("update_interval", None)
+                    logger.info("Sanitized: converted remote rule_set %s to local (%s)", tag, cache_path)
+                # else: leave as remote — container may have direct internet or will fail gracefully
 
         return raw

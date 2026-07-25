@@ -33,6 +33,7 @@ class ConfigDeployer:
         Returns:
             True if deployment succeeded.
         """
+        import os
         if not self._fs.exists(self._profile_path):
             logger.warning("Profile not found: %s", self._profile_path)
             if not self._fs.exists(self._config_dest):
@@ -43,6 +44,7 @@ class ConfigDeployer:
             logger.info(
                 "Copying profile %s -> %s", self._profile_path, self._config_dest
             )
+            self._fs.makedirs(os.path.dirname(self._config_dest))
             self._fs.copy(self._profile_path, self._config_dest)
 
         try:
