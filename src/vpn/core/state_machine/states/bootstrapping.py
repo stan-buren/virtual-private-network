@@ -24,8 +24,10 @@ class BootstrappingState(VpnState):
     async def on_enter(self) -> None:
         logger.info("Entering BOOTSTRAPPING state")
         self._timeout_task = asyncio.create_task(self._on_timeout())
-        # Bootstrap triggered externally by __main__.py
-        pass
+        # Trigger bootstrap via orchestrator
+        orch = self.machine._orchestrator
+        events = self.machine._event_queue
+        asyncio.create_task(orch.bootstrap(self.ctx, events))
 
     async def on_exit(self) -> None:
         if self._timeout_task:

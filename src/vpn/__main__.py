@@ -147,15 +147,9 @@ async def _main() -> None:
     )
     ctx = machine.context
     events = machine._event_queue
-    async def _bootstrap_wrapper():
-        try:
-            await orchestrator.bootstrap(ctx, events)
-        except Exception:
-            logger.exception("Bootstrap crashed")
-            await events.put(VpnEvent(EventType.SINGBOX_DIED))
     machine._orchestrator = orchestrator
-    # Bootstrap via orchestrator (background task, crash-guarded)
-    asyncio.create_task(_bootstrap_wrapper())
+
+    # Bootstrap is triggered by BootstrappingState.on_enter() — no external task needed
 
     # ── Start signal handlers ─────────────────────────────────────────────
     loop = asyncio.get_running_loop()
