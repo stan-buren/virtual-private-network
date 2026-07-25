@@ -1,0 +1,52 @@
+# =============================================================================
+# VPN Hiddify — .gitignore
+# Secrets, runtime data, binaries, and garbage stay out of git.
+# =============================================================================
+
+# --- Secrets & credentials (NEVER commit) ---
+data/
+profile_share_*.json
+.env
+
+# --- Runtime / cache ---
+logs/
+*.log
+*.log.*
+cache/
+cache.db
+tmp/
+.coverage
+.benchmarks/
+.pytest_cache/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# --- Binaries / 3rd-party AppImage extracts ---
+squashfs-root/
+*.AppImage
+
+# --- Temp / backup / test files ---
+vpn_daemon--bak.py
+vpn_daemon_using_akonit_LAST.py
+vpn_daemon_using_macbook.py
+working_free_vlees_last_standing.py
+vless_updater 1 var.py
+vless_updater 2 var.py
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Sensitive ---
+config/

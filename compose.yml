@@ -1,0 +1,14 @@
+services:
+  vpn:
+    image: localhost:5000/vpn:${TAG:-latest}
+    container_name: vpn
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "tcp://${SYSLOG_HOST:-192.168.0.93}:514"
+        syslog-facility: "local0"
+        tag: "vpn"
