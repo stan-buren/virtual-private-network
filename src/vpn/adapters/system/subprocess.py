@@ -17,8 +17,8 @@ class SubprocessAdapter:
         logger.debug("Starting process: %s", args)
         proc = subprocess.Popen(
             args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=None,
+            stderr=None,
             start_new_session=True,
         )
         return PopenHandle(

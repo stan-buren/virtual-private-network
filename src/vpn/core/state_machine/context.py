@@ -6,7 +6,7 @@ process handles, failure counters, and the active server name.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from vpn.core.ports import PopenHandle
 
@@ -37,4 +37,5 @@ class RuntimeContext:
     startup_time: float = 0.0
     active_server: str | None = None
     last_error: str | None = None
+    route_ips: dict[str, list[str]] = field(default_factory=dict)
     target_server: str | None = None

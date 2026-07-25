@@ -33,6 +33,8 @@ class VpnStateMachine:
         rules: Any = None,
         shell: Any = None,
         bypass_cfg: Any = None,
+        vpn_routes_cfg: Any = None,
+        dns_resolver: Any = None,
         paths: dict[str, str] | None = None,
     ) -> None:
         self.context = RuntimeContext()
@@ -46,6 +48,8 @@ class VpnStateMachine:
         self._rules = rules
         self._shell = shell
         self._bypass_cfg = bypass_cfg
+        self._vpn_routes_cfg = vpn_routes_cfg
+        self._dns_resolver = dns_resolver
         self._paths = paths or {}
         self._ipc_server: asyncio.AbstractServer | None = None
 
@@ -153,6 +157,75 @@ class VpnStateMachine:
         if method == "bypass.remove":
             self._bypass_cfg.domains.remove(params["domain"])
             return self._bypass_cfg.domains
+        if method == "stop":
+            ctx = self.context
+            orch = self._orchestrator
+            table_id = orch._app_cfg.table_id
+            if ctx.singbox is not None:
+                ctx.singbox.kill()
+            if ctx.tun2socks is not None:
+                ctx.tun2socks.kill()
+            orch._tun.destroy()
+            orch._route_table.flush(table_id)
+            self._rules.clear_all()
+            orch._nat.remove()
+            orch._mss.remove()
+            orch._sysctl_mgr.restore_ipv6()
+            from vpn.core.state_machine.states.stopped import StoppedState
+            await self.transition_to(StoppedState)
+            return {"status": "stopped"}
+        if method == "start":
+            orch = self._orchestrator
+            table_id = orch._app_cfg.table_id
+            # Idempotent mini-cleanup
+            self._shell.run("ip link del tun0 2>/dev/null || true")
+            self._shell.run("ip route flush table %s 2>/dev/null || true" % table_id)
+            self._shell.run("pkill sing-box 2>/dev/null || true")
+            self._shell.run("pkill tun2socks 2>/dev/null || true")
+            orch._nat.remove()
+            orch._mss.remove()
+            self._rules.clear_all()
+            from vpn.core.state_machine.states.bootstrapping import BootstrappingState
+            await self.transition_to(BootstrappingState)
+            return {"status": "starting"}
+        if method == "route.list":
+            return {
+                "domains": list(self._vpn_routes_cfg.domains),
+                "wildcards": list(self._vpn_routes_cfg.wildcards),
+                "subnets": list(self._vpn_routes_cfg.subnets),
+            }
+        if method == "route.add":
+            orch = self._orchestrator
+            table_id = orch._app_cfg.table_id
+            if "domain" in params:
+                ips = self._dns_resolver.resolve_ipv4(params["domain"], self._shell)
+                for ip in ips:
+                    self._shell.run("ip route add %s dev tun0 table %s 2>/dev/null || true" % (ip, table_id))
+                self._vpn_routes_cfg.domains.append(params["domain"])
+                self.context.route_ips[params["domain"]] = ips
+                return {"domain": params["domain"], "ips": ips}
+            if "wildcard" in params:
+                self._vpn_routes_cfg.wildcards.append(params["wildcard"])
+                return {"wildcard": params["wildcard"], "applied": False, "note": "takes effect on next restart"}
+            if "subnet" in params:
+                self._shell.run("ip route add %s dev tun0 table %s 2>/dev/null || true" % (params["subnet"], table_id))
+                self._vpn_routes_cfg.subnets.append(params["subnet"])
+                return {"subnet": params["subnet"]}
+        if method == "route.remove":
+            orch = self._orchestrator
+            table_id = orch._app_cfg.table_id
+            if "domain" in params:
+                for ip in self.context.route_ips.pop(params["domain"], []):
+                    self._shell.run("ip route del %s table %s 2>/dev/null || true" % (ip, table_id))
+                self._vpn_routes_cfg.domains.remove(params["domain"])
+                return {"domain": params["domain"]}
+            if "wildcard" in params:
+                self._vpn_routes_cfg.wildcards.remove(params["wildcard"])
+                return {"wildcard": params["wildcard"]}
+            if "subnet" in params:
+                self._shell.run("ip route del %s table %s 2>/dev/null || true" % (params["subnet"], table_id))
+                self._vpn_routes_cfg.subnets.remove(params["subnet"])
+                return {"subnet": params["subnet"]}
         if method == "restart":
             await self.post(VpnEvent(EventType.RESTART_REQUESTED))
             return {"status": "restarting"}

@@ -98,13 +98,82 @@ def bypass_remove(domain: str) -> None:
     click.echo(f"Bypass list now: {result}")
 
 
-# ── emergency-reset ──────────────────────────────────────────────────────────
+# ── stop / start ─────────────────────────────────────────────────────────────
 
 @cli.command()
-def emergency_reset() -> None:
-    """Emergency reset: wipe all rules, routes, tun0. Use with caution."""
-    click.echo("Emergency reset — not yet implemented via IPC. Run locally if needed.")
+def stop() -> None:
+    """Stop VPN: wipe all rules, routes, tun0. Traffic goes direct."""
+    result = ipc_call("stop")
+    click.echo(result.get("status", "error"))
 
+
+@cli.command()
+def start() -> None:
+    """Start VPN: bootstrap tunnel, routing, firewall."""
+    result = ipc_call("start")
+    click.echo(result.get("status", "error"))
+
+
+# ── route ────────────────────────────────────────────────────────────────────
+
+@cli.group()
+def route() -> None:
+    """Manage forced-VPN routes (domains forced through VPN tunnel)."""
+
+
+@route.command("list")
+def route_list() -> None:
+    """Show current forced-VPN routes."""
+    result = ipc_call("route.list")
+    click.echo("Domains:")
+    for d in result.get("domains", []):
+        click.echo("  " + d)
+    click.echo("Wildcards:")
+    for w in result.get("wildcards", []):
+        click.echo("  " + w)
+    click.echo("Subnets:")
+    for s in result.get("subnets", []):
+        click.echo("  " + s)
+
+
+@route.command("add")
+@click.option("--domain", "-d", default=None, help="Domain to force through VPN")
+@click.option("--wildcard", "-w", default=None, help="Wildcard pattern (e.g. *.openai.com)")
+@click.option("--subnet", "-s", default=None, help="CIDR subnet to force through VPN")
+def route_add(domain: str | None, wildcard: str | None, subnet: str | None) -> None:
+    """Force a domain, wildcard, or subnet through the VPN tunnel."""
+    params: dict[str, str] = {}
+    if domain:
+        params["domain"] = domain
+    elif wildcard:
+        params["wildcard"] = wildcard
+    elif subnet:
+        params["subnet"] = subnet
+    else:
+        click.echo("Error: specify --domain, --wildcard, or --subnet")
+        return
+    result = ipc_call("route.add", params)
+    click.echo(result)
+
+
+@route.command("remove")
+@click.option("--domain", "-d", default=None, help="Domain to remove")
+@click.option("--wildcard", "-w", default=None, help="Wildcard pattern to remove")
+@click.option("--subnet", "-s", default=None, help="CIDR subnet to remove")
+def route_remove(domain: str | None, wildcard: str | None, subnet: str | None) -> None:
+    """Remove a forced-VPN route."""
+    params: dict[str, str] = {}
+    if domain:
+        params["domain"] = domain
+    elif wildcard:
+        params["wildcard"] = wildcard
+    elif subnet:
+        params["subnet"] = subnet
+    else:
+        click.echo("Error: specify --domain, --wildcard, or --subnet")
+        return
+    result = ipc_call("route.remove", params)
+    click.echo(result)
 
 if __name__ == "__main__":
     cli()

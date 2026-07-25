@@ -141,6 +141,8 @@ async def _main() -> None:
         rules=rules,
         shell=shell,
         bypass_cfg=bypass_cfg,
+        vpn_routes_cfg=vpn_routes_cfg,
+        dns_resolver=dns_resolver,
         paths=paths,
     )
     ctx = machine.context

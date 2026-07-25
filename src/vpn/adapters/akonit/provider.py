@@ -144,7 +144,8 @@ class AkonitProvider:
         Raises:
             KeyError: If *server_name* is unknown.
         """
-        config = self._load_profile()
+        import copy
+        config = copy.deepcopy(self._load_profile())
         raw_tag: str = self._servers_config.servers[server_name].tag
         norm_sub = self._normalize_tag(raw_tag)
 
@@ -223,6 +224,13 @@ class AkonitProvider:
             ob = rule.get("outbound", "")
             if ob and ob != "urltest_out":
                 rule["outbound"] = self._normalize_tag(ob)
+
+        # Normalize outbound tags inside urltest/selector outbounds lists
+        for outbound in raw.get("outbounds", []):
+            if outbound.get("type") in ("urltest", "selector"):
+                outbound["outbounds"] = [
+                    self._normalize_tag(t) for t in outbound.get("outbounds", [])
+                ]
 
         # Remove unsupported 'default' from urltest/selector outbounds
         for outbound in raw.get("outbounds", []):
