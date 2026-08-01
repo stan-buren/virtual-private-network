@@ -1,0 +1,16 @@
+# HP local deployment — uses locally built image, no registry.
+# All VPN rules apply to HP HOST (network_mode: host).
+services:
+  vpn:
+    image: vpn:latest
+    container_name: vpn
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - /opt/vpn/cache:/app/cache
+    env_file:
+      - .env
+    restart: unless-stopped

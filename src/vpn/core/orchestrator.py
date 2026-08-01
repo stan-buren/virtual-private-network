@@ -103,6 +103,10 @@ class VpnOrchestrator:
         """
         logger.info("=== VPN Bootstrap Sequence ===")
 
+        # 0. Pre-bootstrap cleanup — remove leftovers from previous unclean shutdown
+        logger.info("[0/7] Pre-bootstrap cleanup")
+        await self.teardown_network()
+
         # 1. Deploy config
         logger.info("[1/7] Deploying sing-box configuration")
         self._deployer.deploy()
@@ -176,6 +180,36 @@ class VpnOrchestrator:
         # 7. Signal done
         logger.info("[7/7] Bootstrap complete — posting BOOTSTRAP_DONE")
         await events.put(VpnEvent(EventType.BOOTSTRAP_DONE))
+
+
+    async def teardown_network(self) -> None:
+        """Emergency teardown — remove ALL VPN networking modifications.
+
+        Called on: FAILED state entry, SIGTERM/SIGINT, and `vpn stop` IPC.
+        Idempotent: safe to call multiple times, even if partially cleaned.
+        """
+        logger.info("=== VPN Network Teardown ===")
+        table_id = self._app_cfg.table_id
+
+        # 1. Kill processes (best-effort — may already be dead)
+        self._shell.run("pkill sing-box 2>/dev/null || true")
+        self._shell.run("pkill tun2socks 2>/dev/null || true")
+
+        # 2. Tear down tun0 before flushing routes (avoids dead-device errors)
+        self._tun.destroy()
+
+        # 3. Flush table before removing rules (avoids stale lookups)
+        self._route_table.flush(table_id)
+
+        # 4. Remove ALL ip rules (while-loop for each priority — handles duplicates)
+        self._rules.clear_all()
+
+        # 5. Firewall cleanup
+        self._nat.remove()
+        self._mss.remove()
+        self._sysctl_mgr.restore_ipv6()
+
+        logger.info("Teardown complete — host network restored")
 
 
     async def _watch_process(

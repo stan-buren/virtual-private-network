@@ -23,7 +23,16 @@ class FailedState(VpnState):
             "Entering FAILED state — last error: %s",
             self.ctx.last_error or "unknown",
         )
-        # The orchestrator sends the Telegram notification before sys.exit
+        # ── Emergency network teardown BEFORE exit ──────────────────────
+        # Container modifies HOST network stack (network_mode: host).
+        # If we exit without cleanup, ip rules, iptables, table 100,
+        # and tun0 remain on the host — breaking internet on next start.
+        orch = self.machine._orchestrator
+        if orch is not None:
+            try:
+                await orch.teardown_network()
+            except Exception:
+                logger.exception("Teardown during FAILED state crashed")
         logger.info("Shutting down. Container will restart via Docker policy.")
         sys.exit(1)
 

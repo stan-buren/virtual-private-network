@@ -75,11 +75,17 @@ class RuleManager:
         logger.info("Catch-all: all traffic -> table %s (priority %d)", table_id, PRIO_CATCHALL)
 
     def clear_all(self) -> None:
-        """Remove all known priority rules."""
-        self._shell.run("while ip rule del priority 1 2>/dev/null; do :; done")
-        for p in range(2, 31):
-            self._shell.run("ip rule del priority %d 2>/dev/null || true" % p)
-        logger.info("All ip rules cleared")
+        """Remove all known priority rules (1-30), handling duplicates.
+
+        Uses while-loop for EVERY priority — a single ``ip rule del`` only
+        removes one rule.  After a crash-loop there may be multiple rules
+        at the same priority (duplicates from repeated bootstrap attempts).
+        """
+        for p in range(1, 31):
+            self._shell.run(
+                "while ip rule del priority %d 2>/dev/null; do :; done" % p
+            )
+        logger.info("All ip rules cleared (priorities 1-30)")
 
     def clear_server_bypasses(self) -> None:
         """Remove only priority 1 rules (server IP bypasses)."""
