@@ -30,6 +30,9 @@ RUN chmod +x /usr/local/bin/tun2socks
 # Pre-cached rule sets
 COPY data/geoip-ru.srs data/geosite-ru.srs /var/lib/sing-box/
 
+# Ookla Speedtest CLI (network metrics for vpn server speedtest)
+RUN curl -fsSL -o /tmp/speedtest.tgz https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz && tar -xzf /tmp/speedtest.tgz -C /tmp && install -m 0755 /tmp/speedtest /usr/local/bin/speedtest && rm -rf /tmp/speedtest*
+
 # Application
 WORKDIR /app
 COPY pyproject.toml .

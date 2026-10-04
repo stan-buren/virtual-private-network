@@ -37,6 +37,7 @@ class VpnStateMachine:
         dns_resolver: Any = None,
         paths: dict[str, str] | None = None,
         notifier: Any = None,
+        orchestrator: Any = None,
     ) -> None:
         self.context = RuntimeContext()
         self._event_queue: asyncio.Queue[VpnEvent] = asyncio.Queue()
@@ -52,6 +53,7 @@ class VpnStateMachine:
         self._vpn_routes_cfg = vpn_routes_cfg
         self._dns_resolver = dns_resolver
         self._notifier = notifier
+        self._orchestrator = orchestrator
         self._paths = paths or {}
         self._ipc_server: asyncio.AbstractServer | None = None
 
@@ -115,6 +117,39 @@ class VpnStateMachine:
         await writer.drain()
         writer.close()
 
+    def _apply_server(self, name: str) -> str:
+        """(Re)deploy sing-box for *name* and restart the tunnel processes."""
+        result = self._switcher.switch(name, restart_service=False)
+        ctx = self.context
+        orch = self._orchestrator
+        if ctx.singbox is not None:
+            ctx.singbox.kill()
+        ctx.singbox = orch._subprocess.popen([
+            "sing-box", "run",
+            "-c", "/etc/sing-box/config.json",
+            "-D", "/var/lib/sing-box",
+        ])
+        ctx.tun2socks = orch._tun2socks.start("socks5://127.0.0.1:3066")
+        profile_path = self._paths.get("profile_keys", "")
+        server_ips = self._resolver.resolve_all(profile_path, self._shell)
+        self._rules.clear_server_bypasses()
+        for ip in server_ips:
+            self._rules.add_server_bypass(ip)
+        ctx.active_server = name
+        return result
+
+    def _reload_config(self) -> dict:
+        """Reload the updated profile and switch onto a still-valid server."""
+        if hasattr(self._provider, "reload"):
+            self._provider.reload()
+        servers = sorted(s.name for s in self._provider.list_servers())
+        if not servers:
+            raise RuntimeError("no servers found in the updated profile")
+        current = self.context.active_server
+        target = current if current in servers else servers[0]
+        self._apply_server(target)
+        return {"server": target, "count": len(servers)}
+
     async def _dispatch(self, method: str, params: dict):
         if method == "server.list":
             servers = self._provider.list_servers()
@@ -122,29 +157,9 @@ class VpnStateMachine:
         if method == "server.current":
             return {"server": self.context.active_server}
         if method == "server.change":
-            result = self._switcher.switch(params["name"], restart_service=False)
-            ctx = self.context
-            orch = self._orchestrator
-            # Kill old sing-box (guarded)
-            if ctx.singbox is not None:
-                ctx.singbox.kill()
-            # Start new sing-box via proper subprocess
-            ctx.singbox = orch._subprocess.popen([
-                "sing-box", "run",
-                "-c", "/etc/sing-box/config.json",
-                "-D", "/var/lib/sing-box",
-            ])
-            # Restart tun2socks
-            proxy_url = "socks5://127.0.0.1:3066"
-            ctx.tun2socks = orch._tun2socks.start(proxy_url)
-            # Re-apply anti-loop bypass rules
-            profile_path = self._paths.get("profile_keys", "")
-            server_ips = self._resolver.resolve_all(profile_path, self._shell)
-            self._rules.clear_server_bypasses()
-            for ip in server_ips:
-                self._rules.add_server_bypass(ip)
-            ctx.active_server = params["name"]
-            return result
+            return self._apply_server(params["name"])
+        if method == "config.reload":
+            return self._reload_config()
         if method == "status":
             return {
                 "gateway": self.context.gateway,

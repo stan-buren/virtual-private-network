@@ -52,17 +52,21 @@ class TestNotificationConfig:
 
 
 class TestServersConfig:
-    def test_loads_11_servers(self) -> None:
+    def test_loads_all_servers(self) -> None:
         cfg = ServersConfig._from_yaml()
-        assert len(cfg.servers) == 11
-        assert "barguzin" in cfg.servers
-        assert "sirokko" in cfg.servers
+        assert len(cfg.servers) == 14
+        assert "hellenteler" in cfg.servers
+        assert "favoniy" in cfg.servers
+        assert "halni" in cfg.servers
 
     def test_server_entry_has_tag_and_country(self) -> None:
         cfg = ServersConfig._from_yaml()
-        barguzin = cfg.servers["barguzin"]
-        assert "Баргузин" in barguzin.tag
-        assert barguzin.country == "ru"
+        hellenteler = cfg.servers["hellenteler"]
+        assert "Хёллентэлер" in hellenteler.tag
+        assert hellenteler.country == "de"
+        favoniy = cfg.servers["favoniy"]
+        assert "Фавоний" in favoniy.tag
+        assert favoniy.country == "nl"
 
 
 class TestBypassConfig:

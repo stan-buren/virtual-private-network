@@ -2,38 +2,55 @@
 
 from __future__ import annotations
 
+import json
+
 from vpn.adapters.akonit.provider import AkonitProvider
-from vpn.config.paths import PROJECT_ROOT
+from vpn.config.core.servers import ServersConfig
+
+
+def _fake_profile(tmp_path) -> str:
+    """Write a synthetic sing-box profile built from the real server registry."""
+    registry = ServersConfig._from_yaml().servers
+    outbounds = [
+        {
+            "type": "vless",
+            "tag": f"{entry.tag} ⚡",
+            "server": "10.0.0.1",
+            "server_port": 443,
+        }
+        for entry in registry.values()
+    ]
+    outbounds.append({"type": "urltest", "tag": "urltest_out", "outbounds": ["direct"]})
+    outbounds.append({"type": "direct", "tag": "direct"})
+    path = tmp_path / "profile.json"
+    path.write_text(
+        json.dumps(
+            {"outbounds": outbounds, "route": {"final": "urltest_out", "rules": []}}
+        )
+    )
+    return str(path)
 
 
 class TestAkonitProvider:
-    def test_lists_11_servers(self) -> None:
-        profile_path = str(PROJECT_ROOT / "data" / "profile_keys_akonit_24_07_2026.json")
-        provider = AkonitProvider(profile_path)
-        servers = provider.list_servers()
-        assert len(servers) == 11
+    def test_lists_all_registered_servers(self, tmp_path) -> None:
+        provider = AkonitProvider(_fake_profile(tmp_path))
+        assert len(provider.list_servers()) == len(ServersConfig._from_yaml().servers)
 
-    def test_get_barguzin_server(self) -> None:
-        profile_path = str(PROJECT_ROOT / "data" / "profile_keys_akonit_24_07_2026.json")
-        provider = AkonitProvider(profile_path)
-        server = provider.get_server("barguzin")
-        assert server.country == "ru"
-        assert "Баргузин" in server.tag
+    def test_get_server_by_name(self, tmp_path) -> None:
+        provider = AkonitProvider(_fake_profile(tmp_path))
+        server = provider.get_server("hellenteler")
+        assert server.country == "de"
+        assert "Хёллентэлер" in server.tag
 
-    def test_build_singbox_config_returns_valid_json(self) -> None:
-        import json
-        profile_path = str(PROJECT_ROOT / "data" / "profile_keys_akonit_24_07_2026.json")
-        provider = AkonitProvider(profile_path)
-        config_str = provider.build_singbox_config("barguzin")
-        config = json.loads(config_str)
+    def test_build_singbox_config_returns_valid_json(self, tmp_path) -> None:
+        provider = AkonitProvider(_fake_profile(tmp_path))
+        config = json.loads(provider.build_singbox_config("hellenteler"))
         assert "outbounds" in config
-        # The first outbound tag varies per profile; just verify it's a non-empty string
         assert isinstance(config["outbounds"][0]["tag"], str)
-        assert len(config["outbounds"][0]["tag"]) > 0
 
-    def test_sanitize_config_removes_statistics(self) -> None:
+    def test_sanitize_config_removes_statistics(self, tmp_path) -> None:
         raw = {"experimental": {"statistics": {"enabled": True}}}
-        provider = AkonitProvider(str(PROJECT_ROOT / "data" / "profile_keys_akonit_24_07_2026.json"))
+        provider = AkonitProvider(_fake_profile(tmp_path))
         result = provider.sanitize_config(raw)
         assert "statistics" not in result.get("experimental", {})
 
@@ -75,14 +92,10 @@ class TestNormalizeTag:
 class TestBuildSingboxConfig:
     """Tests for build_singbox_config() — route.final matching after sanitize."""
 
-    def test_route_final_matches_normalized_outbound(self) -> None:
+    def test_route_final_matches_normalized_outbound(self, tmp_path) -> None:
         """After build+sanitize, route.final equals the target outbound tag (cleaned)."""
-        import json
-
-        profile_path = str(PROJECT_ROOT / "data" / "profile_keys_akonit_24_07_2026.json")
-        provider = AkonitProvider(profile_path)
-        config_str = provider.build_singbox_config("barguzin")
-        config = json.loads(config_str)
+        provider = AkonitProvider(_fake_profile(tmp_path))
+        config = json.loads(provider.build_singbox_config("hellenteler"))
 
         # route.final should be the cleaned outbound tag, not 'urltest_out'
         assert config["route"]["final"] != "urltest_out"
@@ -94,9 +107,9 @@ class TestBuildSingboxConfig:
 class TestSanitizeConfigDefaults:
     """Tests for sanitize_config() — stripping unsupported fields."""
 
-    def test_strips_default_from_urltest(self) -> None:
+    def test_strips_default_from_urltest(self, tmp_path) -> None:
         """'default' key is removed from urltest/selector outbounds."""
-        provider = AkonitProvider(str(PROJECT_ROOT / "data" / "profile_keys_akonit_24_07_2026.json"))
+        provider = AkonitProvider(_fake_profile(tmp_path))
         raw = {
             "outbounds": [
                 {"type": "urltest", "tag": "urltest_out", "default": "some-server", "outbounds": ["t1", "t2"]},

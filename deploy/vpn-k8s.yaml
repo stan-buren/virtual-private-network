@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vpn
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vpn
+  namespace: vpn
+  labels:
+    app: vpn
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vpn
+  template:
+    metadata:
+      labels:
+        app: vpn
+    spec:
+      hostNetwork: true
+      dnsPolicy: Default
+      nodeSelector:
+        kubernetes.io/hostname: asus-25-498
+      containers:
+      - name: vpn
+        image: __IMAGE__
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        envFrom:
+        - secretRef:
+            name: vpn-env
+        volumeMounts:
+        - name: cache
+          mountPath: /app/cache
+        - name: ssh-key
+          mountPath: /root/.ssh/id_ed25519
+          readOnly: true
+        - name: ssh-known
+          mountPath: /root/.ssh/known_hosts
+          readOnly: true
+      volumes:
+      - name: cache
+        hostPath:
+          path: /opt/vpn/cache
+          type: Directory
+      - name: ssh-key
+        hostPath:
+          path: /root/.ssh/id_ed25519
+          type: File
+      - name: ssh-known
+        hostPath:
+          path: /root/.ssh/known_hosts
+          type: File
+

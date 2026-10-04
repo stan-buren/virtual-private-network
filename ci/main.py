@@ -1,10 +1,10 @@
-"""CI/CD pipeline for VPN project — standalone, no external dependencies.
+"""CI/CD pipeline for the VPN project — standalone, no external dependencies.
 
 Usage:
-    python ci/main.py test     # Run pytest with coverage gate (uses Dagger container)
-    python ci/main.py build    # Build + push versioned Docker image to Asus registry
-    python ci/main.py deploy   # SSH to Asus -> pull -> restart -> health-check
-    python ci/main.py pipeline # test -> build -> deploy (full pipeline)
+    python ci/main.py test      # pytest with coverage gate (Dagger container)
+    python ci/main.py build     # build + push a versioned image to the HP registry
+    python ci/main.py deploy    # roll the image out onto the ASUS k3s cluster
+    python ci/main.py pipeline  # test -> build -> deploy (full pipeline)
 
     deploy accepts --version <tag> (default: latest)
 """
@@ -12,13 +12,25 @@ Usage:
 from __future__ import annotations
 
 import datetime
+import json
 import subprocess
 import sys
+import time
+from pathlib import Path
 
+# ── deployment targets ───────────────────────────────────────────────────────
+REGISTRY = "192.168.0.93:5000"          # registry address the k3s node pulls from
+REGISTRY_PUSH = "localhost:5000"         # docker pushes via localhost (trusted by default)
+ASUS_SSH = "donald_trump@192.168.0.131"  # k3s node that runs the vpn pod
+NAMESPACE = "vpn"
+DEPLOYMENT = "vpn"
+MANIFEST = Path("deploy/vpn-k8s.yaml")
 
 _USAGE = "Usage: python ci/main.py [test|build|deploy|pipeline] [--version TAG]"
+
+
 def _version() -> str:
-    """Generate version tag: YYYYMMDD-HHMMSS-<7-char git hash>."""
+    """Generate a version tag: YYYYMMDD-HHMMSS-<7-char git hash>."""
     now = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     sha = subprocess.run(
         ["git", "rev-parse", "--short=7", "HEAD"],
@@ -28,15 +40,18 @@ def _version() -> str:
     ).stdout.strip()
     return f"{now}-{sha}"
 
+
 async def _get_client():
     """Obtain a Dagger client connection (for containerized operations)."""
     from typing import cast
+
     import dagger as _dagger
+
     return cast(_dagger.Client, await _dagger.Connection())
 
 
 async def test() -> str:
-    """Run pytest in a clean Python 3.12 container with >=80% coverage gate."""
+    """Run pytest in a clean Python 3.12 container with an >=80% coverage gate."""
     async with await _get_client() as client:
         return await (
             client.container()
@@ -65,71 +80,120 @@ async def test() -> str:
 
 
 async def build() -> str:
-    """Build versioned Docker image and push to Asus local registry.
+    """Build a versioned Docker image and push it to the HP registry.
 
-    Tags both :<version> and :latest so Asus can pin a specific version
-    or always pull the latest.  Does NOT use Dagger — calls docker CLI directly.
+    Tags both :<version> and :latest.  Pushes to the registry under
+    localhost (which Docker trusts by default); the k3s node pulls the same
+    repository over the LAN IP.
 
     Returns:
         The generated version tag string.
     """
     version = _version()
+    local = f"vpn:{version}"
     for cmd in [
-        ["docker", "build", "-t", f"vpn:{version}", "."],
-        ["docker", "tag", f"vpn:{version}", f"192.168.0.131:5000/vpn:{version}"],
-        ["docker", "push", f"192.168.0.131:5000/vpn:{version}"],
-        ["docker", "tag", f"vpn:{version}", "192.168.0.131:5000/vpn:latest"],
-        ["docker", "push", "192.168.0.131:5000/vpn:latest"],
+        ["docker", "build", "-t", local, "."],
+        ["docker", "tag", local, f"{REGISTRY_PUSH}/vpn:{version}"],
+        ["docker", "push", f"{REGISTRY_PUSH}/vpn:{version}"],
+        ["docker", "tag", local, f"{REGISTRY_PUSH}/vpn:latest"],
+        ["docker", "push", f"{REGISTRY_PUSH}/vpn:latest"],
     ]:
         subprocess.run(cmd, check=True)
     print(version)
     return version
 
 
-async def deploy(version: str | None = None) -> str:
-    """Deploy a versioned image to the Asus router via SSH.
+def _secret_yaml(env_text: str) -> str:
+    """Render a vpn-env Secret manifest from a dotenv file's contents."""
+    lines = [
+        "apiVersion: v1",
+        "kind: Secret",
+        "metadata:",
+        "  name: vpn-env",
+        f"  namespace: {NAMESPACE}",
+        "type: Opaque",
+        "stringData:",
+    ]
+    for raw in env_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        lines.append(f"  {key.strip()}: {json.dumps(value.strip())}")
+    return "\n".join(lines) + "\n"
 
-    1. mkdir -p /opt/vpn/cache     — ensure volume dir exists
-    2. scp compose.yml             — always push latest compose config
-    3. docker compose down          — stop running container
-    4. TAG=<version> docker compose up -d  — start with new image
-    5. Health-check: poll docker logs for 'HEALTHY' (up to 10 attempts x 2s)
-    6. Fail loudly if HEALTHY never appears
+
+def _ssh(remote: str, *, input_text: str | None = None) -> subprocess.CompletedProcess:
+    """Run a command on the ASUS node over SSH."""
+    return subprocess.run(
+        ["ssh", ASUS_SSH, remote],
+        input=input_text,
+        text=True,
+        capture_output=True,
+    )
+
+
+def _health_check() -> None:
+    """Verify the pod's tunnel really carries traffic (not just a log line)."""
+    remote = (
+        "P=$(kubectl -n vpn get pod -l app=vpn -o jsonpath='{.items[0].metadata.name}'); "
+        "kubectl -n vpn exec $P -- sh -c "
+        "'pgrep -f sing-box >/dev/null && pgrep -f tun2socks >/dev/null && "
+        "ss -ltn | grep -q 3066 && curl -4 -s -m 15 https://ifconfig.me/ip'"
+    )
+    last = ""
+    for _ in range(12):
+        result = _ssh(remote)
+        exit_ip = (result.stdout or "").strip()
+        if result.returncode == 0 and exit_ip:
+            print(f"health OK — tunnel exit {exit_ip}")
+            return
+        last = result.stderr or result.stdout or ""
+        time.sleep(5)
+    raise RuntimeError(f"health check failed: {last}")
+
+
+async def deploy(version: str | None = None) -> str:
+    """Deploy a versioned image to the ASUS k3s cluster.
+
+    1. Ensure the namespace and the vpn-env Secret exist.
+    2. Apply the rendered manifest (image pinned to the version tag).
+    3. Wait for the rollout and verify the tunnel carries traffic.
 
     Args:
         version: Image tag to deploy. Defaults to 'latest'.
     """
-    if version is None:
-        version = "latest"
+    version = version or "latest"
+    image = f"{REGISTRY}/vpn:{version}"
 
-    # Push latest compose.yml + .env so Asus has fresh config + credentials
-    subprocess.run(
-        ["scp", "compose.yml", ".env", "donald_trump@192.168.0.131:/opt/vpn/"],
-        check=True,
-    )
+    ns = "kubectl create namespace vpn --dry-run=client -o yaml | kubectl apply -f -"
+    if _ssh(ns).returncode != 0:
+        raise RuntimeError("failed to ensure namespace")
 
-    remote = (
-        "mkdir -p /opt/vpn/cache && cd /opt/vpn && docker compose down && "
-        f"TAG={version} docker compose up -d && "
-        "for i in $(seq 1 10); do "
-        "  docker logs vpn --tail 3 2>/dev/null | grep -q HEALTHY && exit 0; "
-        "  sleep 2; "
-        "done; "
-        "echo 'FATAL: container not healthy after 20s' >&2; exit 1"
+    env_text = Path(".env").read_text(encoding="utf-8")
+    if _ssh("kubectl apply -f -", input_text=_secret_yaml(env_text)).returncode != 0:
+        raise RuntimeError("failed to apply vpn-env secret")
+
+    manifest = MANIFEST.read_text(encoding="utf-8").replace("__IMAGE__", image)
+    applied = _ssh("kubectl apply -f -", input_text=manifest)
+    if applied.returncode != 0:
+        raise RuntimeError(f"manifest apply failed: {applied.stderr}")
+    print(applied.stdout.strip())
+
+    rollout = _ssh(
+        f"kubectl -n {NAMESPACE} rollout status deployment/{DEPLOYMENT} --timeout=180s"
     )
-    cmd = f"ssh donald_trump@192.168.0.131 '{remote}'"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr or "deploy failed")
-    print(result.stdout or result.stderr)
+    if rollout.returncode != 0:
+        raise RuntimeError(f"rollout failed: {rollout.stderr or rollout.stdout}")
+    print(rollout.stdout.strip())
+
+    _health_check()
+    print(f"deployed {image}")
     return version
 
 
 async def pipeline() -> str:
-    """Run the full pipeline: test -> build -> deploy.
-
-    Fails fast: test failures block build, build failures block deploy.
-    """
+    """Run the full pipeline: test -> build -> deploy. Fails fast."""
     print("=== TEST ===")
     print(await test())
 
@@ -144,9 +208,8 @@ async def pipeline() -> str:
 
 async def main() -> None:
     """CLI dispatcher — route argv to the right function."""
-    usage = "Usage: python ci/main.py [test|build|deploy|pipeline] [--version TAG]"
     if len(sys.argv) < 2:
-        print(usage)
+        print(_USAGE)
         sys.exit(1)
 
     command = sys.argv[1]
@@ -162,10 +225,12 @@ async def main() -> None:
         print(await pipeline())
     else:
         print(f"Unknown command: {command}")
-        print(usage)
+        print(_USAGE)
         sys.exit(1)
 
 
 if __name__ == "__main__":
     import anyio
+
     anyio.run(main)
+

@@ -59,6 +59,10 @@ class AkonitProvider:
                 self._profile_data = json.load(f)
         return self._profile_data
 
+    def reload(self) -> None:
+        """Drop the cached profile so the next call re-reads it from disk."""
+        self._profile_data = None
+
     def _find_outbound(self, tag_substring: str) -> dict[str, Any] | None:
         """Return the first outbound whose ``tag`` contains *tag_substring*.
 
@@ -206,6 +210,13 @@ class AkonitProvider:
             rule.pop("name", None)
         for rule in raw.get("route", {}).get("rules", []):
             rule.pop("name", None)
+
+        # Drop route-level fields unsupported by the pinned sing-box build
+        route = raw.get("route", {})
+        for field in ("sniff", "sniff_override_destination"):
+            if field in route:
+                del route[field]
+                logger.info("Sanitized: removed route.%s", field)
 
         # Normalize all outbound tags (strip emoji suffixes from Akonit)
         for outbound in raw.get("outbounds", []):

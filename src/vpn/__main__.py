@@ -40,6 +40,7 @@ from vpn.core.routing.tun_interface import TunInterface
 from vpn.core.ru_updater.updater import RuSubnetUpdater
 from vpn.core.server_manager.deployer import ConfigDeployer
 from vpn.core.server_manager.switcher import ServerSwitcher
+from vpn.core.speedtest import SpeedtestStore
 from vpn.core.state_machine.machine import VpnStateMachine
 from vpn.core.state_machine.states.bootstrapping import BootstrappingState
 from vpn.core.topology.discovery import DnsResolver, ServerIpResolver, TopologyDiscovery
@@ -56,6 +57,8 @@ async def _main() -> None:
 
     # ── Load configs ──────────────────────────────────────────────────────
     paths = load_paths_config(PROJECT_ROOT)
+    # Wipe previous speedtest results so no stale history survives a restart.
+    SpeedtestStore(PROJECT_ROOT / paths.get("cache_dir", "cache")).clear()
     app_cfg = get_app_config()
     net_cfg = get_network_config()
     health_cfg = get_health_config()
