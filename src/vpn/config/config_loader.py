@@ -14,7 +14,6 @@ from vpn.config.core.bypass import BypassConfig
 from vpn.config.core.health import HealthConfig
 from vpn.config.core.network import NetworkConfig
 from vpn.config.core.notification import NotificationConfig
-from vpn.config.core.servers import ServersConfig
 from vpn.config.core.subscription import SubscriptionConfig
 from vpn.config.core.tunnel import TunnelConfig
 from vpn.config.core.vpn_routes import VpnRoutesConfig
@@ -48,12 +47,6 @@ def get_tunnel_config() -> TunnelConfig:
 def get_notification_config() -> NotificationConfig:
     """Loads and returns the cached NotificationConfig singleton."""
     return NotificationConfig._from_yaml()
-
-
-@cache
-def get_servers_config() -> ServersConfig:
-    """Loads and returns the cached ServersConfig singleton."""
-    return ServersConfig._from_yaml()
 
 
 @cache

@@ -7,7 +7,6 @@ from vpn.config.core.bypass import BypassConfig
 from vpn.config.core.health import HealthConfig
 from vpn.config.core.network import NetworkConfig
 from vpn.config.core.notification import NotificationConfig
-from vpn.config.core.servers import ServerEntry, ServersConfig
 from vpn.config.core.tunnel import TunnelConfig
 from vpn.config.core.vpn_routes import VpnRoutesConfig
 
@@ -17,8 +16,6 @@ __all__ = [
     "HealthConfig",
     "NetworkConfig",
     "NotificationConfig",
-    "ServerEntry",
-    "ServersConfig",
     "TunnelConfig",
     "VpnRoutesConfig",
 ]

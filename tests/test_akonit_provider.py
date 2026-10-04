@@ -5,23 +5,26 @@ from __future__ import annotations
 import json
 
 from vpn.adapters.akonit.provider import AkonitProvider
-from vpn.config.core.servers import ServersConfig
 
 
 def _fake_profile(tmp_path) -> str:
-    """Write a synthetic sing-box profile built from the real server registry."""
-    registry = ServersConfig._from_yaml().servers
+    """Write a synthetic sing-box profile with a couple of provider servers."""
     outbounds = [
         {
             "type": "vless",
-            "tag": f"{entry.tag} ⚡",
+            "tag": "🇩🇪 🌀 Хёллентэлер - Германия ⚡",
             "server": "10.0.0.1",
             "server_port": 443,
-        }
-        for entry in registry.values()
+        },
+        {
+            "type": "vless",
+            "tag": "🇳🇱 Фавоний - Нидерланды 🌊🛡 ✂️",
+            "server": "10.0.0.2",
+            "server_port": 443,
+        },
+        {"type": "urltest", "tag": "urltest_out", "outbounds": ["direct"]},
+        {"type": "direct", "tag": "direct"},
     ]
-    outbounds.append({"type": "urltest", "tag": "urltest_out", "outbounds": ["direct"]})
-    outbounds.append({"type": "direct", "tag": "direct"})
     path = tmp_path / "profile.json"
     path.write_text(
         json.dumps(
@@ -32,9 +35,10 @@ def _fake_profile(tmp_path) -> str:
 
 
 class TestAkonitProvider:
-    def test_lists_all_registered_servers(self, tmp_path) -> None:
+    def test_lists_all_profile_servers(self, tmp_path) -> None:
         provider = AkonitProvider(_fake_profile(tmp_path))
-        assert len(provider.list_servers()) == len(ServersConfig._from_yaml().servers)
+        names = {s.name for s in provider.list_servers()}
+        assert names == {"hellenteler", "favoniy"}
 
     def test_get_server_by_name(self, tmp_path) -> None:
         provider = AkonitProvider(_fake_profile(tmp_path))

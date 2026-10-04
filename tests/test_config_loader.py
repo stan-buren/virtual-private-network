@@ -7,7 +7,6 @@ from vpn.config.core.bypass import BypassConfig
 from vpn.config.core.health import HealthConfig
 from vpn.config.core.network import NetworkConfig
 from vpn.config.core.notification import NotificationConfig
-from vpn.config.core.servers import ServersConfig
 from vpn.config.core.tunnel import TunnelConfig
 from vpn.config.core.vpn_routes import VpnRoutesConfig
 
@@ -49,24 +48,6 @@ class TestNotificationConfig:
         cfg = NotificationConfig._from_yaml()
         assert cfg.retries == 3
         assert "daemon_started" in cfg.events
-
-
-class TestServersConfig:
-    def test_loads_all_servers(self) -> None:
-        cfg = ServersConfig._from_yaml()
-        assert len(cfg.servers) == 14
-        assert "hellenteler" in cfg.servers
-        assert "favoniy" in cfg.servers
-        assert "halni" in cfg.servers
-
-    def test_server_entry_has_tag_and_country(self) -> None:
-        cfg = ServersConfig._from_yaml()
-        hellenteler = cfg.servers["hellenteler"]
-        assert "Хёллентэлер" in hellenteler.tag
-        assert hellenteler.country == "de"
-        favoniy = cfg.servers["favoniy"]
-        assert "Фавоний" in favoniy.tag
-        assert favoniy.country == "nl"
 
 
 class TestBypassConfig:

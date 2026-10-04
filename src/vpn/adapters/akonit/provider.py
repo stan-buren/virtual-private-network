@@ -7,7 +7,7 @@ import re
 import logging
 from typing import Any
 
-from vpn.config.config_loader import get_servers_config
+from vpn.adapters.akonit.catalog import build_catalog, normalize_tag
 from vpn.core.ports import ServerInfo, VpnProviderPort
 
 logger = logging.getLogger("vpn")
@@ -38,9 +38,7 @@ class AkonitProvider:
     @staticmethod
     def _normalize_tag(tag: str) -> str:
         """Strip emoji, '(Без рекламы)', and collapse whitespace from a tag."""
-        tag = _EMOJI_RE.sub("", tag)
-        tag = tag.replace("(Без рекламы)", "")
-        return " ".join(tag.split()).strip()
+        return normalize_tag(tag)
 
     def __init__(self, profile_path: str) -> None:
         """Initialise the provider with the path to the sing-box profile JSON.
@@ -49,7 +47,6 @@ class AkonitProvider:
             profile_path: Absolute or relative path to the profile JSON file.
         """
         self._profile_path = profile_path
-        self._servers_config = get_servers_config()
         self._profile_data: dict[str, Any] | None = None
 
     def _load_profile(self) -> dict[str, Any]:
@@ -63,48 +60,16 @@ class AkonitProvider:
         """Drop the cached profile so the next call re-reads it from disk."""
         self._profile_data = None
 
-    def _find_outbound(self, tag_substring: str) -> dict[str, Any] | None:
-        """Return the first outbound whose ``tag`` contains *tag_substring*.
-
-        Both sides are normalized (emoji stripped) before comparison.
-
-        Args:
-            tag_substring: The provider tag (from servers.yaml) to match against
-                outbound ``"tag"`` fields.
-
-        Returns:
-            The matching outbound dict, or ``None`` if no outbound matches.
-        """
-        norm_sub = self._normalize_tag(tag_substring)
-        profile = self._load_profile()
-        for outbound in profile.get("outbounds", []):
-            if norm_sub in self._normalize_tag(outbound.get("tag", "")):
-                return outbound
-        return None
-
     # ------------------------------------------------------------------ VpnProviderPort
 
     def list_servers(self) -> list[ServerInfo]:
-        """Return every server present in both the registry and the profile JSON.
+        """Return every VPN server parsed directly from the provider profile.
 
         Returns:
-            A list of :class:`ServerInfo` entries, one per registered server that
-            has a matching outbound in the profile.
+            A list of :class:`ServerInfo` entries, one per proxy outbound in the
+            provider profile (the single source of truth for available servers).
         """
-        result: list[ServerInfo] = []
-        for name, entry in self._servers_config.servers.items():
-            outbound = self._find_outbound(entry.tag)
-            if outbound is not None:
-                result.append(
-                    ServerInfo(
-                        name=name,
-                        tag=outbound.get("tag", entry.tag),
-                        country=entry.country,
-                        host=outbound.get("server", "unknown"),
-                        port=outbound.get("server_port", 443),
-                    )
-                )
-        return result
+        return build_catalog(self._load_profile())
 
     def get_server(self, name: str) -> ServerInfo:
         """Return metadata for a single server by its CLI name.
@@ -119,19 +84,10 @@ class AkonitProvider:
             KeyError: If *name* is unknown or the matching outbound is missing
                 from the profile.
         """
-        entry = self._servers_config.servers[name]
-        outbound = self._find_outbound(entry.tag)
-        if outbound is None:
-            raise KeyError(
-                "Server '%s' (tag: '%s') not found in profile" % (name, entry.tag)
-            )
-        return ServerInfo(
-            name=name,
-            tag=outbound.get("tag", entry.tag),
-            country=entry.country,
-            host=outbound.get("server", "unknown"),
-            port=outbound.get("server_port", 443),
-        )
+        for server in self.list_servers():
+            if server.name == name:
+                return server
+        raise KeyError("Server '%s' not found in profile" % name)
 
     def build_singbox_config(self, server_name: str) -> str:
         """Return a sing-box config.json with *server_name* as the active outbound.
@@ -150,16 +106,9 @@ class AkonitProvider:
         """
         import copy
         config = copy.deepcopy(self._load_profile())
-        raw_tag: str = self._servers_config.servers[server_name].tag
-        norm_sub = self._normalize_tag(raw_tag)
-
-        # Find the real outbound tag by normalized substring match
-        target: str | None = None
-        for ob in config.get("outbounds", []):
-            if norm_sub in self._normalize_tag(ob.get("tag", "")):
-                target = ob["tag"]
-                break
-        if target is None:
+        server = self.get_server(server_name)
+        target: str = server.tag
+        if not any(ob.get("tag") == target for ob in config.get("outbounds", [])):
             raise KeyError("Server %r not found in profile" % server_name)
 
         # Replace urltest_out with chosen server tag in all route rules

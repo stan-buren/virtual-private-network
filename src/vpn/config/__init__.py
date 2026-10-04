@@ -8,7 +8,6 @@ from vpn.config.config_loader import (
     get_health_config,
     get_network_config,
     get_notification_config,
-    get_servers_config,
     get_tunnel_config,
     get_vpn_routes_config,
 )
@@ -21,7 +20,6 @@ __all__ = [
     "get_health_config",
     "get_network_config",
     "get_notification_config",
-    "get_servers_config",
     "get_tunnel_config",
     "get_vpn_routes_config",
     "load_paths_config",
