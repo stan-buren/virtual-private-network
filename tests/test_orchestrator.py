@@ -96,7 +96,13 @@ class TestOrchestratorRestartTunnel:
         assert ctx.tun2socks is not None
         tun2socks.start.assert_called_once_with("socks5://127.0.0.1:3066")
         assert watcher.watch.call_count == 2
-        # Routing is intentionally reused: no rule/route teardown happens here.
+        # The tun device is destroyed and rebuilt so the new tun2socks starts
+        # from a clean device instead of one whose route is stuck "linkdown".
+        orch._tun.destroy.assert_called_once()
+        orch._tun.create.assert_called_once()
+        # Deleting tun0 drops its default route from table 100 - re-assert it.
+        orch._route_table.set_default.assert_called_once_with("100")
+        # Policy rules and bypasses are reused: no rule teardown happens here.
         orch._rules.clear_all.assert_not_called()
         orch._route_table.flush.assert_not_called()
 

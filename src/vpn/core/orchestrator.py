@@ -92,6 +92,8 @@ class VpnOrchestrator:
         self._vpn_routes_cfg = vpn_routes_cfg
         self._paths = paths
         self._subprocess = subprocess
+        self._tunnel_lock = asyncio.Lock()
+
     async def bootstrap(self, ctx: RuntimeContext, events: asyncio.Queue[VpnEvent]) -> None:
         """Execute the full bootstrap sequence.
 
@@ -247,19 +249,27 @@ class VpnOrchestrator:
         Raises:
             VpnConnectionError: If sing-box never opens its SOCKS listener.
         """
-        logger.info("=== Tunnel Restart ===")
-        self._watcher.unwatch(EventType.SINGBOX_DIED)
-        self._watcher.unwatch(EventType.TUNNEL_DIED)
-        self._shell.run("pkill sing-box 2>/dev/null || true")
-        self._shell.run("pkill tun2socks 2>/dev/null || true")
-        await asyncio.sleep(0)  # let the kills land before respawning
+        async with self._tunnel_lock:
+            logger.info("=== Tunnel Restart ===")
+            self._watcher.unwatch(EventType.SINGBOX_DIED)
+            self._watcher.unwatch(EventType.TUNNEL_DIED)
+            # tun2socks first: nothing may keep dialing a half-dead tunnel.
+            self._shell.run("pkill tun2socks 2>/dev/null || true")
+            self._shell.run("pkill sing-box 2>/dev/null || true")
+            # Destroy the device instead of reusing it: a tun that outlived its
+            # tun2socks keeps the table-100 default route marked "linkdown", and
+            # traffic then dies inside a tunnel nobody reads.
+            self._tun.destroy()
+            await asyncio.sleep(0)  # let the kills land before respawning
 
-        self.start_singbox(ctx)
-        await self._wait_for_socks_port()
-        self._tun.create()
-        self.start_tun2socks(ctx)
-        ctx.startup_time = time.time()
-        logger.info("Tunnel restart complete")
+            self.start_singbox(ctx)
+            await self._wait_for_socks_port()
+            self._tun.create()
+            # Re-assert the default route: deleting tun0 drops it from table 100.
+            self._route_table.set_default(self._app_cfg.table_id)
+            self.start_tun2socks(ctx)
+            ctx.startup_time = time.time()
+            logger.info("Tunnel restart complete")
 
     async def _wait_for_socks_port(self, timeout: int = 15) -> None:
         """Block until sing-box accepts connections on the SOCKS port.

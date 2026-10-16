@@ -46,7 +46,9 @@ class HealthChecker:
             delay = random.randint(self._interval_min, self._interval_max)
             await asyncio.sleep(delay)
 
-            ok = self._check()
+            # _check() shells out to curl synchronously; run it in a thread
+            # so a slow probe never stalls the state machine's event loop.
+            ok = await asyncio.get_running_loop().run_in_executor(None, self._check)
             event = VpnEvent(
                 type=EventType.HEALTH_OK if ok else EventType.HEALTH_FAIL,
                 payload={"target": getattr(self, "_last_target", "unknown")},
