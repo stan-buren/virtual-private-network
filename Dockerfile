@@ -32,8 +32,13 @@ RUN curl -fsSL -o /tmp/sing-box.tar.gz \
 # Pinned by version AND sha256: this binary is where a nil-dereference in the
 # bundled gVisor build used to kill the tunnel, so the upgrade path must live in
 # the image, not in a hand-copied file in data/ (which is gitignored).
-ARG TUN2SOCKS_VERSION=2.7.0
-ARG TUN2SOCKS_SHA256=a612baa287a3b6de6221f74fd02b442a50888508227ecf51e1288a5ccbb77381
+# v2.7.0 was tried and reverted: its process starts and logs its banner, but it
+# never brings the externally-created tun0 to carrier-up, so the table-100
+# default route stays "linkdown" and the host silently stops tunnelling (seen on
+# HP and ASUS, 2026-10-16). Adopt 2.7 only together with its new device contract
+# (let tun2socks own the device) and a real end-to-end check.
+ARG TUN2SOCKS_VERSION=2.6.0
+ARG TUN2SOCKS_SHA256=2c4d9891ca898ecb2b582d158612d44c66793008328852b3465b77828c867e77
 RUN curl -fsSL -o /tmp/tun2socks.zip \
       "https://github.com/xjasonlyu/tun2socks/releases/download/v${TUN2SOCKS_VERSION}/tun2socks-linux-amd64.zip" \
     && echo "${TUN2SOCKS_SHA256}  /tmp/tun2socks.zip" | sha256sum -c - \
