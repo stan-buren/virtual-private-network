@@ -31,8 +31,8 @@ class SpeedtestRunner:
         shell: ShellPort,
         binary: str = "speedtest",
         timeout: int = 150,
-        attempts: int = 2,
-        retry_delay: int = 3,
+        attempts: int = 4,
+        retry_delay: int = 5,
     ) -> None:
         """Store the shell port, binary name, per-run timeout, and retry policy."""
         self._shell = shell

@@ -89,23 +89,41 @@ def _echo(text: str = "", *, err: bool = False) -> None:
 
 
 def _tunnel_ready() -> bool:
-    """True when outbound HTTPS works through the tunnel."""
+    """True when outbound traffic actually leaves through the tunnel.
+
+    Probes a literal IP on purpose: the previous check fetched
+    https://ifconfig.me/ip by name, so a flaky/slow DNS path through the tunnel
+    was reported as a dead tunnel even when the data path was fine (the node
+    then still answered Ookla tests).
+    """
     res = ShellAdapter().run(
-        "curl -s -m 8 -o /dev/null -w '%{http_code}' https://ifconfig.me/ip",
+        "curl -s -m 8 -o /dev/null -w '%{http_code}' https://1.1.1.1",
         capture=True,
         timeout=12,
     )
-    return bool(res and res.returncode == 0 and res.stdout.strip().startswith("200"))
+    code = res.stdout.strip() if res and res.stdout else ""
+    return bool(res and res.returncode == 0 and code and code != "000")
 
 
-def _switch_and_wait(name: str, attempts: int = 25) -> None:
-    """Switch the active server and wait until the tunnel carries traffic."""
+def _switch_and_wait(name: str, attempts: int = 25) -> bool:
+    """Switch the active server; wait for the tunnel but never abort the run.
+
+    Returns True once the tunnel carries traffic, or False when the wait
+    elapsed.  Callers proceed with the speedtest either way so a marginal node
+    still reports a number (or Ookla's own error) instead of a blanket
+    "tunnel not ready".
+    """
     ipc_call("server.change", {"name": name})
+    ready = 0
     for _ in range(attempts):
         if _tunnel_ready():
-            return
+            ready += 1
+            if ready >= 2:  # two consecutive OKs: the new tunnel has settled
+                return True
+        else:
+            ready = 0
         time.sleep(1)
-    raise SpeedtestError(f"tunnel not ready after switching to {name}")
+    return False
 
 
 def _run_with_heartbeat(runner: SpeedtestRunner) -> dict:
@@ -186,7 +204,12 @@ def _run_speedtest(targets: list[str] | None) -> int:
             entry: dict = {"country": country, "tested_at": _now()}
             _echo(f"[{idx}/{total}] {name} ({country}): switching tunnel ...")
             try:
-                _switch_and_wait(name)
+                if not _switch_and_wait(name):
+                    _echo(
+                        f"[{idx}/{total}] {name}: warning - tunnel not confirmed "
+                        "ready, testing anyway ...",
+                        err=True,
+                    )
                 _echo(f"[{idx}/{total}] {name}: speedtest running ...", )
                 entry.update(_run_with_heartbeat(runner))
             except Exception as exc:
@@ -202,10 +225,17 @@ def _run_speedtest(targets: list[str] | None) -> int:
                     f"jitter={entry['jitter_ms']} ip={entry['external_ip']}"
                 )
 
-        if original and original in by_name and original not in names:
+        # Always restore: leaving the last tested node active can strand the
+        # host on a dead server and take the whole machine offline.
+        if original and original in by_name:
             _echo(f"Restoring active server: {original} ...")
             try:
-                _switch_and_wait(original)
+                if not _switch_and_wait(original):
+                    _echo(
+                        f"warning: could not confirm restore of {original} "
+                        "(tunnel not ready)",
+                        err=True,
+                    )
             except Exception as exc:
                 _echo(f"warning: could not restore {original}: {exc}", err=True)
 
