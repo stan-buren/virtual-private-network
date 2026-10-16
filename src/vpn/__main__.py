@@ -31,6 +31,7 @@ from vpn.core.firewall.mss import MssClamp
 from vpn.core.firewall.nat import NatManager
 from vpn.core.firewall.sysctl import SysctlManager
 from vpn.core.health.checker import HealthChecker
+from vpn.core.health.process_watcher import ProcessWatcher
 from vpn.core.notification.telegram import TelegramNotifier
 from vpn.core.orchestrator import VpnOrchestrator
 from vpn.core.routing.bypass_loader import BypassLoader
@@ -110,6 +111,8 @@ async def _main() -> None:
     )
 
     # ── Wire orchestrator ─────────────────────────────────────────────────
+    events: asyncio.Queue[VpnEvent] = asyncio.Queue()
+    watcher = ProcessWatcher(events)
     orchestrator = VpnOrchestrator(
         deployer=config_deployer,
         topology_discovery=topology_discovery,
@@ -125,6 +128,7 @@ async def _main() -> None:
         provider=provider,
         notifier=telegram,
         ru_updater=ru_updater,
+        watcher=watcher,
         shell=shell,
         subprocess=subproc,
         app_cfg=app_cfg,
@@ -148,10 +152,11 @@ async def _main() -> None:
         dns_resolver=dns_resolver,
         paths=paths,
         notifier=telegram,
+        events=events,
+        health_checker=health_checker,
+        watcher=watcher,
+        orchestrator=orchestrator,
     )
-    ctx = machine.context
-    events = machine._event_queue
-    machine._orchestrator = orchestrator
 
     # Bootstrap is triggered by BootstrappingState.on_enter() — no external task needed
 

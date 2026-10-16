@@ -38,9 +38,12 @@ class VpnStateMachine:
         paths: dict[str, str] | None = None,
         notifier: Any = None,
         orchestrator: Any = None,
+        health_checker: Any = None,
+        watcher: Any = None,
+        events: asyncio.Queue[VpnEvent] | None = None,
     ) -> None:
         self.context = RuntimeContext()
-        self._event_queue: asyncio.Queue[VpnEvent] = asyncio.Queue()
+        self._event_queue: asyncio.Queue[VpnEvent] = events if events is not None else asyncio.Queue()
         self._current_state: VpnState | None = None
         self._initial_state_cls = initial_state_cls
         self._running = False
@@ -54,8 +57,11 @@ class VpnStateMachine:
         self._dns_resolver = dns_resolver
         self._notifier = notifier
         self._orchestrator = orchestrator
+        self._health_checker = health_checker
+        self._watcher = watcher
         self._paths = paths or {}
         self._ipc_server: asyncio.AbstractServer | None = None
+        self._background_tasks: list[asyncio.Task[None]] = []
 
     @property
     def current_state(self) -> VpnState | None:
@@ -77,6 +83,7 @@ class VpnStateMachine:
         self._running = True
         await self.transition_to(self._initial_state_cls)
         await self._start_ipc()
+        self._start_background_tasks()
         logger.info("State machine running")
         while self._running:
             try:
@@ -92,6 +99,27 @@ class VpnStateMachine:
 
     def stop(self) -> None:
         self._running = False
+        for task in self._background_tasks:
+            task.cancel()
+        self._background_tasks.clear()
+        if self._watcher is not None:
+            self._watcher.stop()
+
+    def _start_background_tasks(self) -> None:
+        """Start the daemon's long-running safety nets exactly once.
+
+        Without them a dead tunnel is never noticed (no death event reaches the
+        state machine) and a blackholed host is never recovered (no health
+        event reaches it either).
+        """
+        if self._health_checker is not None:
+            self._background_tasks.append(
+                asyncio.create_task(
+                    self._health_checker.run_forever(self._event_queue),
+                    name="health-checker",
+                )
+            )
+            logger.info("Connectivity health checker started")
 
     # ── IPC ───────────────────────────────────────────────────────────────
 
@@ -117,19 +145,21 @@ class VpnStateMachine:
         await writer.drain()
         writer.close()
 
-    def _apply_server(self, name: str) -> str:
-        """(Re)deploy sing-box for *name* and restart the tunnel processes."""
+    @staticmethod
+    def _is_alive(handle: Any) -> bool:
+        """Return True while *handle* has not exited."""
+        return handle is not None and handle.poll() is None
+
+    async def _apply_server(self, name: str) -> str:
+        """(Re)deploy sing-box for *name* and restart the tunnel processes.
+
+        The restart itself lives in the orchestrator, so bootstrap, server
+        switches and recovery all replace the processes the same way — and all
+        of them leave a live watcher behind.
+        """
         result = self._switcher.switch(name, restart_service=False)
         ctx = self.context
-        orch = self._orchestrator
-        if ctx.singbox is not None:
-            ctx.singbox.kill()
-        ctx.singbox = orch._subprocess.popen([
-            "sing-box", "run",
-            "-c", "/etc/sing-box/config.json",
-            "-D", "/var/lib/sing-box",
-        ])
-        ctx.tun2socks = orch._tun2socks.start("socks5://127.0.0.1:3066")
+        await self._orchestrator.restart_tunnel(ctx)
         profile_path = self._paths.get("profile_keys", "")
         server_ips = self._resolver.resolve_all(profile_path, self._shell)
         self._rules.clear_server_bypasses()
@@ -138,7 +168,7 @@ class VpnStateMachine:
         ctx.active_server = name
         return result
 
-    def _reload_config(self) -> dict:
+    async def _reload_config(self) -> dict:
         """Reload the updated profile and switch onto a still-valid server."""
         if hasattr(self._provider, "reload"):
             self._provider.reload()
@@ -147,7 +177,7 @@ class VpnStateMachine:
             raise RuntimeError("no servers found in the updated profile")
         current = self.context.active_server
         target = current if current in servers else servers[0]
-        self._apply_server(target)
+        await self._apply_server(target)
         return {"server": target, "count": len(servers)}
 
     async def _dispatch(self, method: str, params: dict):
@@ -157,14 +187,15 @@ class VpnStateMachine:
         if method == "server.current":
             return {"server": self.context.active_server}
         if method == "server.change":
-            return self._apply_server(params["name"])
+            return await self._apply_server(params["name"])
         if method == "config.reload":
-            return self._reload_config()
+            return await self._reload_config()
         if method == "status":
             return {
                 "gateway": self.context.gateway,
                 "interface": self.context.interface,
-                "tun2socks_alive": self.context.tun2socks is not None,
+                "tun2socks_alive": self._is_alive(self.context.tun2socks),
+                "singbox_alive": self._is_alive(self.context.singbox),
             }
         if method == "bypass.list":
             return self._bypass_cfg.domains

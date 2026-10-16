@@ -14,6 +14,7 @@ from vpn.core.events import EventType, VpnEvent
 from vpn.core.firewall.mss import MssClamp
 from vpn.core.firewall.nat import NatManager
 from vpn.core.firewall.sysctl import SysctlManager
+from vpn.core.health.process_watcher import ProcessWatcher
 from vpn.core.ports import ShellPort, SubprocessPort, VpnProviderPort
 from vpn.logger.exceptions import VpnConnectionError
 from vpn.core.routing.bypass_loader import BypassLoader
@@ -58,6 +59,7 @@ class VpnOrchestrator:
         provider: VpnProviderPort,
         notifier: TelegramNotifier,
         ru_updater: RuSubnetUpdater,
+        watcher: ProcessWatcher,
         shell: ShellPort,
         subprocess: SubprocessPort,
         app_cfg: AppConfig,
@@ -81,6 +83,7 @@ class VpnOrchestrator:
         self._provider = provider
         self._notifier = notifier
         self._ru_updater = ru_updater
+        self._watcher = watcher
         self._shell = shell
         self._app_cfg = app_cfg
         self._net_cfg = net_cfg
@@ -113,14 +116,7 @@ class VpnOrchestrator:
 
         # 2. Start sing-box (no port-wait — _watch_process catches failures)
         logger.info("[2/7] Starting sing-box process")
-        ctx.singbox = self._subprocess.popen([
-            "sing-box", "run",
-            "-c", "/etc/sing-box/config.json",
-            "-D", "/var/lib/sing-box",
-        ])
-        asyncio.create_task(
-            self._watch_process(ctx.singbox, events, VpnEvent(EventType.SINGBOX_DIED))
-        )
+        self.start_singbox(ctx)
         logger.debug("[2/7] sing-box process launched, proceeding to topology")
         topology = self._topology_discovery.discover()
         ctx.gateway = topology.gateway
@@ -170,8 +166,7 @@ class VpnOrchestrator:
 
         # 6. Start tunnel + background tasks
         logger.info("[6/7] Starting tunnel and background tasks")
-        proxy_url = "socks5://%s:%d" % (self._tunnel_cfg.socks5_host, self._tunnel_cfg.socks5_port)
-        ctx.tun2socks = self._tun2socks.start(proxy_url)
+        self.start_tun2socks(ctx)
         ctx.startup_time = time.time()
         servers = self._provider.list_servers()
         ctx.active_server = servers[0].name if servers else "unknown"
@@ -212,15 +207,76 @@ class VpnOrchestrator:
         logger.info("Teardown complete — host network restored")
 
 
-    async def _watch_process(
-        self, handle: PopenHandle, events: asyncio.Queue[VpnEvent], event: VpnEvent
-    ) -> None:
-        """Monitor a subprocess and post an event when it exits.
+    def start_singbox(self, ctx: RuntimeContext) -> None:
+        """Launch sing-box and place it under supervision.
 
-        Uses run_in_executor to avoid blocking the asyncio event loop
-        on the synchronous subprocess.wait() call.
+        Args:
+            ctx: Runtime context that receives the new process handle.
         """
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, handle.wait, None)
-        logger.warning("Process PID %d exited", handle.pid)
-        await events.put(event)
+        ctx.singbox = self._subprocess.popen([
+            "sing-box", "run",
+            "-c", "/etc/sing-box/config.json",
+            "-D", "/var/lib/sing-box",
+        ])
+        self._watcher.watch(EventType.SINGBOX_DIED, ctx.singbox)
+
+    def start_tun2socks(self, ctx: RuntimeContext) -> None:
+        """Launch tun2socks against the sing-box SOCKS listener.
+
+        Args:
+            ctx: Runtime context that receives the new process handle.
+        """
+        proxy_url = "socks5://%s:%d" % (
+            self._tunnel_cfg.socks5_host,
+            self._tunnel_cfg.socks5_port,
+        )
+        ctx.tun2socks = self._tun2socks.start(proxy_url)
+        self._watcher.watch(EventType.TUNNEL_DIED, ctx.tun2socks)
+
+    async def restart_tunnel(self, ctx: RuntimeContext) -> None:
+        """Replace both tunnel processes without touching host routing.
+
+        Bootstrap, server switches and recovery all need the same thing: a
+        fresh sing-box that actually listens, and a fresh tun2socks bound to
+        it. Policy routing, firewall state and the tun device are reused, so
+        the host is never re-routed and never left pointing at a dead tunnel.
+
+        Args:
+            ctx: Runtime context holding the process handles.
+
+        Raises:
+            VpnConnectionError: If sing-box never opens its SOCKS listener.
+        """
+        logger.info("=== Tunnel Restart ===")
+        self._watcher.unwatch(EventType.SINGBOX_DIED)
+        self._watcher.unwatch(EventType.TUNNEL_DIED)
+        self._shell.run("pkill sing-box 2>/dev/null || true")
+        self._shell.run("pkill tun2socks 2>/dev/null || true")
+        await asyncio.sleep(0)  # let the kills land before respawning
+
+        self.start_singbox(ctx)
+        await self._wait_for_socks_port()
+        self._tun.create()
+        self.start_tun2socks(ctx)
+        ctx.startup_time = time.time()
+        logger.info("Tunnel restart complete")
+
+    async def _wait_for_socks_port(self, timeout: int = 15) -> None:
+        """Block until sing-box accepts connections on the SOCKS port.
+
+        Args:
+            timeout: Maximum seconds to wait for the listener.
+
+        Raises:
+            VpnConnectionError: If the listener never appears.
+        """
+        host = self._tunnel_cfg.socks5_host
+        port = self._tunnel_cfg.socks5_port
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            probe = self._shell.run("ss -ltnH 'sport = :%d' 2>/dev/null" % port, capture=True)
+            if probe is not None and (probe.stdout or "").strip():
+                logger.info("SOCKS listener up on %s:%d", host, port)
+                return
+            await asyncio.sleep(0.5)
+        raise VpnConnectionError("SOCKS port %d did not open within %ds" % (port, timeout))

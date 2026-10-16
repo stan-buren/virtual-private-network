@@ -60,8 +60,8 @@ class HealthyState(VpnState):
             await self.transition_to(
                 __import__("vpn.core.state_machine.states.restarting", fromlist=["RestartingState"]).RestartingState
             )
-        elif event.type == EventType.TUNNEL_DIED:
-            logger.error("tun2socks died unexpectedly in HEALTHY state")
+        elif event.type in (EventType.TUNNEL_DIED, EventType.SINGBOX_DIED):
+            logger.error("%s received in HEALTHY state", event.type.name)
             await self.transition_to(
                 __import__("vpn.core.state_machine.states.restarting", fromlist=["RestartingState"]).RestartingState
             )

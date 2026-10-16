@@ -15,7 +15,12 @@ RUN apt-get update && apt-get install -y \
 # Python deps
 RUN pip3 install --no-cache-dir click pyyaml python-dotenv
 
-# Install sing-box binary — version pinned to match provider config compatibility
+# Install sing-box binary.
+# PINNED ON PURPOSE: the provider profile still ships legacy DNS server formats,
+# which sing-box 1.14.0 removed ("legacy DNS server formats ... removed in
+# sing-box 1.14.0"). Do NOT bump past 1.12.x until the profile is migrated to the
+# new DNS server formats and route.default_domain_resolver is set — verify with:
+#   sing-box check -c <generated config.json>
 ARG SING_BOX_VERSION=1.12.17
 RUN curl -fsSL -o /tmp/sing-box.tar.gz \
     "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz" \
@@ -23,9 +28,18 @@ RUN curl -fsSL -o /tmp/sing-box.tar.gz \
     && install -m 0755 /tmp/sing-box-*/sing-box /usr/local/bin/sing-box \
     && rm -rf /tmp/sing-box*
 
-# Copy statically-linked tun2socks binary
-COPY data/tun2socks /usr/local/bin/tun2socks
-RUN chmod +x /usr/local/bin/tun2socks
+# Install tun2socks — the gVisor-based stack that bridges tun0 to the SOCKS proxy.
+# Pinned by version AND sha256: this binary is where a nil-dereference in the
+# bundled gVisor build used to kill the tunnel, so the upgrade path must live in
+# the image, not in a hand-copied file in data/ (which is gitignored).
+ARG TUN2SOCKS_VERSION=2.7.0
+ARG TUN2SOCKS_SHA256=a612baa287a3b6de6221f74fd02b442a50888508227ecf51e1288a5ccbb77381
+RUN curl -fsSL -o /tmp/tun2socks.zip \
+      "https://github.com/xjasonlyu/tun2socks/releases/download/v${TUN2SOCKS_VERSION}/tun2socks-linux-amd64.zip" \
+    && echo "${TUN2SOCKS_SHA256}  /tmp/tun2socks.zip" | sha256sum -c - \
+    && python3 -m zipfile -e /tmp/tun2socks.zip /tmp \
+    && install -m 0755 /tmp/tun2socks-linux-amd64 /usr/local/bin/tun2socks \
+    && rm -rf /tmp/tun2socks*
 
 # Pre-cached rule sets
 COPY data/geoip-ru.srs data/geosite-ru.srs /var/lib/sing-box/

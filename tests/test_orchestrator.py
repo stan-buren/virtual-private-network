@@ -1,15 +1,16 @@
-"""Tests for VpnOrchestrator bootstrap sequence ordering."""
+"""Tests for VpnOrchestrator bootstrap sequence ordering and tunnel restart."""
 
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from vpn.core.events import EventType, VpnEvent
 from vpn.core.orchestrator import VpnOrchestrator
 from vpn.core.state_machine.context import RuntimeContext
+from vpn.logger.exceptions import VpnConnectionError
 
 
 def _mock_orch(**overrides):
@@ -29,6 +30,7 @@ def _mock_orch(**overrides):
         "provider": MagicMock(),
         "notifier": MagicMock(),
         "ru_updater": MagicMock(run_forever=AsyncMock()),
+        "watcher": MagicMock(),
         "shell": MagicMock(),
         "subprocess": MagicMock(),
         "app_cfg": MagicMock(table_id="100"),
@@ -43,22 +45,14 @@ def _mock_orch(**overrides):
 
 
 class TestOrchestratorBootstrap:
-    """Tests for VpnOrchestrator.bootstrap() with _watch_process patched.
-
-    _watch_process is patched out because it creates a background asyncio
-    task that monitors the sing-box subprocess handle. Mocked subprocess
-    handles can cause _watch_process to post SINGBOX_DIED immediately,
-    racing with the BOOTSTRAP_DONE event posted at the end of bootstrap().
-    We test the bootstrap SEQUENCE, not process monitoring.
-    """
+    """Tests for the bootstrap SEQUENCE, not process monitoring."""
 
     @pytest.mark.asyncio
     async def test_bootstrap_posts_bootstrap_done(self) -> None:
         ctx = RuntimeContext()
         events: asyncio.Queue[VpnEvent] = asyncio.Queue()
-        with patch.object(VpnOrchestrator, "_watch_process", new_callable=AsyncMock):
-            orch = _mock_orch()
-            await orch.bootstrap(ctx, events)
+        orch = _mock_orch()
+        await orch.bootstrap(ctx, events)
         event = events.get_nowait()
         assert event.type == EventType.BOOTSTRAP_DONE
 
@@ -68,8 +62,54 @@ class TestOrchestratorBootstrap:
         events: asyncio.Queue[VpnEvent] = asyncio.Queue()
         mock_topo = MagicMock()
         mock_topo.discover.return_value = MagicMock(gateway="10.0.0.1", interface="eth0")
-        with patch.object(VpnOrchestrator, "_watch_process", new_callable=AsyncMock):
-            orch = _mock_orch(topology_discovery=mock_topo)
-            await orch.bootstrap(ctx, events)
+        orch = _mock_orch(topology_discovery=mock_topo)
+        await orch.bootstrap(ctx, events)
         assert ctx.gateway == "10.0.0.1"
         assert ctx.interface == "eth0"
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_supervises_both_processes(self) -> None:
+        """Bootstrap must hand both children to the watcher."""
+        ctx = RuntimeContext()
+        events: asyncio.Queue[VpnEvent] = asyncio.Queue()
+        watcher = MagicMock()
+        orch = _mock_orch(watcher=watcher)
+        await orch.bootstrap(ctx, events)
+        watched = [call.args[0] for call in watcher.watch.call_args_list]
+        assert watched == [EventType.SINGBOX_DIED, EventType.TUNNEL_DIED]
+
+
+class TestOrchestratorRestartTunnel:
+    """Tests for the shared restart path used by recovery and server switches."""
+
+    @pytest.mark.asyncio
+    async def test_restart_replaces_processes_and_keeps_routing(self) -> None:
+        ctx = RuntimeContext()
+        watcher = MagicMock()
+        tun2socks = MagicMock()
+        shell = MagicMock()
+        orch = _mock_orch(watcher=watcher, tun2socks=tun2socks, shell=shell)
+        await orch.restart_tunnel(ctx)
+        watcher.unwatch.assert_any_call(EventType.SINGBOX_DIED)
+        watcher.unwatch.assert_any_call(EventType.TUNNEL_DIED)
+        assert ctx.singbox is not None
+        assert ctx.tun2socks is not None
+        tun2socks.start.assert_called_once_with("socks5://127.0.0.1:3066")
+        assert watcher.watch.call_count == 2
+        # Routing is intentionally reused: no rule/route teardown happens here.
+        orch._rules.clear_all.assert_not_called()
+        orch._route_table.flush.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_wait_for_socks_port_raises_when_never_open(self) -> None:
+        orch = _mock_orch()
+        with pytest.raises(VpnConnectionError):
+            await orch._wait_for_socks_port(timeout=0)
+
+    @pytest.mark.asyncio
+    async def test_restart_propagates_missing_listener(self) -> None:
+        shell = MagicMock()
+        shell.run.return_value = MagicMock(stdout="")
+        orch = _mock_orch(shell=shell)
+        with pytest.raises(VpnConnectionError):
+            await orch.restart_tunnel(RuntimeContext())

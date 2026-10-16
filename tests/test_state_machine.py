@@ -6,6 +6,7 @@ import asyncio
 import sys
 from contextlib import contextmanager
 from typing import Iterator, Type
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -17,7 +18,7 @@ from vpn.core.state_machine.states.bootstrapping import BootstrappingState
 from vpn.core.state_machine.states.degraded import DegradedState
 from vpn.core.state_machine.states.failed import FailedState
 from vpn.core.state_machine.states.healthy import HealthyState
-from vpn.core.state_machine.states.restarting import RestartingState
+from vpn.core.state_machine.states.restarting import MAX_RECOVERY_ATTEMPTS, RestartingState
 
 
 # ---------------------------------------------------------------------------
@@ -641,3 +642,59 @@ class TestIpcDispatch:
 
         result = await machine._dispatch("server.current", {})
         assert result == {"server": "test"}
+
+# ---------------------------------------------------------------------------
+# RestartingState recovery — process death must lead to a real restart
+# ---------------------------------------------------------------------------
+
+
+class TestRestartingRecovery:
+    """Recovery must replace the tunnel processes and report the outcome."""
+
+    @pytest.mark.asyncio
+    async def test_recovery_restarts_tunnel_then_healthy(self) -> None:
+        machine = VpnStateMachine(RestartingState)
+        orch = MagicMock()
+        orch.restart_tunnel = AsyncMock()
+        machine._orchestrator = orch
+        await _transition_to(machine, RestartingState)
+        event = await asyncio.wait_for(machine._event_queue.get(), timeout=2)
+        assert event.type == EventType.BOOTSTRAP_DONE
+        orch.restart_tunnel.assert_awaited_once()
+        await _handle_event(machine, event)
+        assert isinstance(machine.current_state, HealthyState)
+
+    @pytest.mark.asyncio
+    async def test_failed_restart_reports_timeout(self) -> None:
+        machine = VpnStateMachine(RestartingState)
+        orch = MagicMock()
+        orch.restart_tunnel = AsyncMock(side_effect=RuntimeError("boom"))
+        machine._orchestrator = orch
+        await _transition_to(machine, RestartingState)
+        event = await asyncio.wait_for(machine._event_queue.get(), timeout=2)
+        assert event.type == EventType.TIMEOUT
+        await _handle_event(machine, event)
+        assert isinstance(machine.current_state, FailedState)
+
+    @pytest.mark.asyncio
+    async def test_missing_orchestrator_reports_timeout(self) -> None:
+        machine = VpnStateMachine(RestartingState)
+        machine._orchestrator = None
+        await _transition_to(machine, RestartingState)
+        event = await asyncio.wait_for(machine._event_queue.get(), timeout=2)
+        assert event.type == EventType.TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_recovery_budget_exhausted_goes_failed(self) -> None:
+        machine = VpnStateMachine(RestartingState)
+        machine.context.recovery_count = MAX_RECOVERY_ATTEMPTS
+        await _transition_to(machine, RestartingState)
+        assert isinstance(machine.current_state, FailedState)
+        assert "budget" in (machine.context.last_error or "")
+
+    @pytest.mark.asyncio
+    async def test_singbox_death_during_recovery_goes_failed(self) -> None:
+        machine = VpnStateMachine(RestartingState)
+        await _transition_to(machine, RestartingState)
+        await _handle_event(machine, VpnEvent(type=EventType.SINGBOX_DIED))
+        assert isinstance(machine.current_state, FailedState)

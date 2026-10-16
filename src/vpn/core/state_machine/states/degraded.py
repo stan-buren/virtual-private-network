@@ -44,8 +44,8 @@ class DegradedState(VpnState):
             await self.transition_to(
                 __import__("vpn.core.state_machine.states.failed", fromlist=["FailedState"]).FailedState
             )
-        elif event.type == EventType.TUNNEL_DIED:
-            logger.error("tun2socks died in DEGRADED state")
+        elif event.type in (EventType.TUNNEL_DIED, EventType.SINGBOX_DIED):
+            logger.error("%s received in DEGRADED state", event.type.name)
             await self.transition_to(
                 __import__("vpn.core.state_machine.states.restarting", fromlist=["RestartingState"]).RestartingState
             )

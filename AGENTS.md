@@ -34,7 +34,7 @@ Entry (__main__.py)
 | `src/vpn/config/` | YAML SSOT → frozen dataclasses, paths.py resolution, config_loader facade |
 | `src/vpn/logger/` | Scoped "vpn" logger, dual formatters (text/JSON), exception hierarchy |
 | `ci/` | CI/CD pipeline script (test/build/deploy/pipeline) |
-| `tests/` | 16 test files, 165 tests, pytest + asyncio + cov + mock |
+| `tests/` | 18 test files, 213 tests, pytest + asyncio + cov + mock |
 | `config/` | YAML configs (gitignored — use `config/` on Asus or `config_env/` locally) |
 | `data/` | Static binaries and profile data (gitignored except .srs files) |
 | `docker/` | Docker build context artifacts |
@@ -117,6 +117,14 @@ class AkonitProvider:
 ```
 ALWAYS normalize both sides of a tag comparison. Profile emoji suffixes drift between updates.
 
+### Process supervision & recovery (read before touching tunnel lifecycle)
+
+- Every long-lived child goes through `ProcessWatcher` (`core/health/process_watcher.py`). Start processes only via `VpnOrchestrator.start_singbox()` / `start_tun2socks()` / `restart_tunnel()` — they register (and re-register) the watcher, so a deliberately replaced process never reports as crashed.
+- `ProcessWatcher.watch()` cancels the previous watcher for that event type first. A process that is killed on purpose must not post a death event.
+- Never assume "the daemon noticed". The connectivity checker is started by `VpnStateMachine.run()` (`_start_background_tasks`); `ctx.singbox`/`ctx.tun2socks` handles are polled by the watcher. A state that handles `TUNNEL_DIED`/`SINGBOX_DIED` without anyone posting those events is dead code — that exact gap once left a blackholed host up until a manual restart.
+- Recovery is real: `RestartingState` calls `orchestrator.restart_tunnel()` and converts the result into `BOOTSTRAP_DONE` (success) or `TIMEOUT` (failure). Budget: `MAX_RECOVERY_ATTEMPTS`; timeout: `RESTART_TIMEOUT` (30 s, includes the SOCKS port wait).
+- Liveness for the CLI: `vpn status` reports `tun2socks_alive`/`singbox_alive` from `handle.poll()`, never from "handle exists".
+
 ### Error handling
 - `try/except Exception` with `logger.exception()` for crash-guarded blocks (bootstrap, process watchers)
 - `raise KeyError(f"Server {name!r} not found")` — use `!r` in error messages
@@ -146,7 +154,8 @@ ALWAYS normalize both sides of a tag comparison. Profile emoji suffixes drift be
 |---|---|
 | `src/vpn/__main__.py` | Entry point — wires all adapters → orchestrator → state machine → asyncio.run() |
 | `src/vpn/core/ports.py` | ALL protocol interfaces. The contract between core and adapters. |
-| `src/vpn/core/orchestrator.py` | 7-step bootstrap: deploy → sing-box → topology → routing → firewall → tunnel → BOOTSTRAP_DONE |
+| `src/vpn/core/orchestrator.py` | 7-step bootstrap: deploy → sing-box → topology → routing → firewall → tunnel → BOOTSTRAP_DONE. Also owns `restart_tunnel()` — the single process-restart path used by bootstrap, server switches and recovery |
+| `src/vpn/core/health/process_watcher.py` | Process supervision. One watcher per child kind; posts `TUNNEL_DIED` / `SINGBOX_DIED` exactly once per death and stays silent when a process is deliberately replaced |
 | `src/vpn/core/state_machine/machine.py` | Event loop + IPC server (13 RPC methods) + state transitions |
 | `src/vpn/core/state_machine/states/bootstrapping.py` | Most complex state — crash-guarded bootstrap, 60s timeout |
 | `src/vpn/adapters/akonit/provider.py` | VLESS Reality adapter — config gen, emoji normalization, sanitizer |
@@ -165,7 +174,8 @@ ALWAYS normalize both sides of a tag comparison. Profile emoji suffixes drift be
 - **Docker**: `docker build --no-cache` (BuildKit caches stale source layers)
 - **Docker Compose**: `docker compose` (not `docker-compose`), explicit `TAG=` env
 - **OS**: Linux only — uses `AF_UNIX` sockets, `iproute2`, `iptables`, `/dev/net/tun`
-- **sing-box**: v1.12.17 (pinned — provider config format dependent)
+- **sing-box**: v1.12.17 — **does not upgrade past 1.12.x yet**: the provider profile still ships legacy DNS server formats, which 1.14.0 removed. Verify any bump with `sing-box check -c <generated config.json>` (1.14.3 fails: "legacy DNS server formats ... removed in sing-box 1.14.0"). Migration guide: <https://sing-box.sagernet.org/migration/#migrate-to-new-dns-server-formats>
+- **tun2socks**: v2.7.0, fetched in the Dockerfile pinned by version **and** sha256 (never a hand-copied binary: `data/` is gitignored). It bundles gVisor; a nil-dereference in an older bundled build is what used to kill the tunnel.
 - **Version tags**: `YYYYMMDD-HHMMSS-<7-char git hash>` — zero-config, traceable
 - **CI/CD**: Offline-first — local Docker Registry on Asus (192.168.0.131:5000), no GitHub dependency on deploy
 
@@ -188,7 +198,7 @@ uv run pytest -k "IpcDispatch" -v            # filter by test name
 ### Coverage
 - Gate: **≥80%** (enforced by `--cov-fail-under=80`)
 - `just test` or `just pipeline` — both enforce the gate
-- Current: 165 tests, ~80% coverage
+- Current: 213 tests, ~80% coverage
 
 ### Test patterns
 - **Mocking**: `unittest.mock.MagicMock` for services, `AsyncMock` for async methods
