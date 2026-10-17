@@ -263,10 +263,10 @@ class TestDegradedTransitions:
         """Degraded stays Degraded when fail_streak < 3 after HEALTH_FAIL."""
         machine = VpnStateMachine(DegradedState)
         await machine.transition_to(DegradedState)
-        machine.context.fail_streak = 1
+        machine.context.fail_streak = 0
         await _handle_event(machine, VpnEvent(type=EventType.HEALTH_FAIL))
         assert isinstance(machine.current_state, DegradedState)
-        assert machine.context.fail_streak == 2
+        assert machine.context.fail_streak == 1
 
     @pytest.mark.asyncio
     async def test_third_fail_to_restarting(self) -> None:
@@ -330,9 +330,12 @@ class TestRestartingTransitions:
         assert machine.context.recovery_count == 0
         await machine.transition_to(RestartingState)
         assert machine.context.recovery_count == 1
+        # A healthy tunnel resets the recovery budget so the next outage
+        # gets a full set of attempts instead of an exhausted one.
         await machine.transition_to(HealthyState)
+        assert machine.context.recovery_count == 0
         await machine.transition_to(RestartingState)
-        assert machine.context.recovery_count == 2
+        assert machine.context.recovery_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -386,12 +389,8 @@ class TestFailStreak:
         assert machine.context.fail_streak == 1
 
         await _handle_event(machine, VpnEvent(type=EventType.HEALTH_FAIL))
-        assert isinstance(machine.current_state, DegradedState)
-        assert machine.context.fail_streak == 2
-
-        await _handle_event(machine, VpnEvent(type=EventType.HEALTH_FAIL))
         assert isinstance(machine.current_state, RestartingState)
-        assert machine.context.fail_streak == 3
+        assert machine.context.fail_streak == 2
 
 
 # ---------------------------------------------------------------------------
@@ -655,12 +654,12 @@ class TestRestartingRecovery:
     async def test_recovery_restarts_tunnel_then_healthy(self) -> None:
         machine = VpnStateMachine(RestartingState)
         orch = MagicMock()
-        orch.restart_tunnel = AsyncMock()
+        orch.restart_and_verify = AsyncMock(return_value=True)
         machine._orchestrator = orch
         await _transition_to(machine, RestartingState)
         event = await asyncio.wait_for(machine._event_queue.get(), timeout=2)
         assert event.type == EventType.BOOTSTRAP_DONE
-        orch.restart_tunnel.assert_awaited_once()
+        orch.restart_and_verify.assert_awaited_once()
         await _handle_event(machine, event)
         assert isinstance(machine.current_state, HealthyState)
 
@@ -668,7 +667,9 @@ class TestRestartingRecovery:
     async def test_failed_restart_reports_timeout(self) -> None:
         machine = VpnStateMachine(RestartingState)
         orch = MagicMock()
-        orch.restart_tunnel = AsyncMock(side_effect=RuntimeError("boom"))
+        orch.restart_and_verify = AsyncMock(side_effect=RuntimeError("boom"))
+        orch.rotate_and_restart = AsyncMock(return_value=False)
+        orch.refresh_and_restart = AsyncMock(return_value=False)
         machine._orchestrator = orch
         await _transition_to(machine, RestartingState)
         event = await asyncio.wait_for(machine._event_queue.get(), timeout=2)

@@ -31,7 +31,7 @@ class TestNetworkConfig:
 class TestHealthConfig:
     def test_loads_from_yaml(self) -> None:
         cfg = HealthConfig._from_yaml()
-        assert cfg.fail_threshold == 3
+        assert cfg.fail_threshold == 2
         assert len(cfg.targets) >= 5
         assert len(cfg.user_agents) >= 3
 

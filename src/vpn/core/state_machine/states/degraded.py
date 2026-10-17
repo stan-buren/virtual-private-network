@@ -35,8 +35,12 @@ class DegradedState(VpnState):
             logger.warning(
                 "Health check failed (%d consecutive)", self.ctx.fail_streak
             )
-            if self.ctx.fail_streak >= 3:
-                logger.error("Fail threshold reached, entering RESTARTING")
+            threshold = getattr(self.ctx, "fail_threshold", 2)
+            if self.ctx.fail_streak >= threshold:
+                logger.error(
+                    "Fail threshold reached (%d), entering RESTARTING",
+                    threshold,
+                )
                 await self.transition_to(
                     __import__("vpn.core.state_machine.states.restarting", fromlist=["RestartingState"]).RestartingState
                 )

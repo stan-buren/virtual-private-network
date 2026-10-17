@@ -33,6 +33,7 @@ class RuntimeContext:
     tun2socks: PopenHandle | None = None
     singbox: PopenHandle | None = None
     fail_streak: int = 0
+    fail_threshold: int = 2
     recovery_count: int = 0
     startup_time: float = 0.0
     active_server: str | None = None

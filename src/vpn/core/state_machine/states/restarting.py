@@ -10,7 +10,7 @@ from vpn.core.state_machine.states.base import VpnState
 
 logger = logging.getLogger("vpn")
 
-RESTART_TIMEOUT = 30  # seconds — covers the sing-box SOCKS port wait
+RECOVERY_TIMEOUT = 240  # seconds — restart, rotation and subscription refresh
 MAX_RECOVERY_ATTEMPTS = 5
 
 
@@ -51,7 +51,7 @@ class RestartingState(VpnState):
                 __import__("vpn.core.state_machine.states.healthy", fromlist=["HealthyState"]).HealthyState
             )
         elif event.type == EventType.TIMEOUT:
-            self.ctx.last_error = "Restart timed out after %ds" % RESTART_TIMEOUT
+            self.ctx.last_error = "Recovery timed out after %ds" % RECOVERY_TIMEOUT
             logger.error(self.ctx.last_error)
             await self.transition_to(
                 __import__("vpn.core.state_machine.states.failed", fromlist=["FailedState"]).FailedState
@@ -68,10 +68,15 @@ class RestartingState(VpnState):
             )
 
     async def _restart_tunnel(self) -> None:
-        """Run tunnel recovery in the background and report its outcome.
+        """Run the recovery ladder and report its real outcome.
 
-        The orchestrator performs the restart; this state translates the result
-        into the event the recovery loop is waiting for.
+        Restarting the same broken config is only the first rung: when the
+        selected provider endpoint is dead the processes come back and the
+        host stays blackholed. Every rung is therefore verified through the
+        SOCKS inbound, and the ladder escalates — restart, rotate to a
+        reachable node, refresh the subscription, rotate again. A
+        "Recovery successful" line can no longer be printed for a tunnel that
+        does not carry traffic.
         """
         orchestrator = getattr(self.machine, "_orchestrator", None)
         events = self.machine._event_queue
@@ -80,14 +85,36 @@ class RestartingState(VpnState):
             logger.error(self.ctx.last_error)
             await events.put(VpnEvent(type=EventType.TIMEOUT))
             return
-        try:
-            await orchestrator.restart_tunnel(self.ctx)
-        except Exception:
-            logger.exception("Tunnel restart failed")
-            await events.put(VpnEvent(type=EventType.TIMEOUT))
-        else:
+
+        ok = await self._rung("restart", orchestrator.restart_and_verify)
+        if not ok:
+            ok = await self._rung("rotate", orchestrator.rotate_and_restart)
+        if not ok:
+            ok = await self._rung("config update", orchestrator.refresh_and_restart)
+        if not ok:
+            ok = await self._rung("rotate after update", orchestrator.rotate_and_restart)
+
+        if ok:
             await events.put(VpnEvent(type=EventType.BOOTSTRAP_DONE))
+        else:
+            self.ctx.last_error = "All recovery rungs failed — no node carries traffic"
+            logger.error(self.ctx.last_error)
+            await events.put(VpnEvent(type=EventType.TIMEOUT))
+
+    async def _rung(self, name: str, action) -> bool:
+        """Run one recovery rung and report whether it produced a live tunnel."""
+        logger.info("Recovery rung: %s", name)
+        try:
+            ok = bool(await action(self.ctx))
+        except Exception:
+            logger.exception("Recovery rung %r crashed", name)
+            return False
+        if ok:
+            logger.info("Recovery rung %r verified — tunnel carries traffic", name)
+        else:
+            logger.warning("Recovery rung %r did not produce a working tunnel", name)
+        return ok
 
     async def _on_timeout(self) -> None:
-        await asyncio.sleep(RESTART_TIMEOUT)
+        await asyncio.sleep(RECOVERY_TIMEOUT)
         await self.machine.post(VpnEvent(type=EventType.TIMEOUT))

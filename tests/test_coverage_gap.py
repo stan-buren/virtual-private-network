@@ -30,9 +30,14 @@ class TestHealthChecker:
         from vpn.core.health.checker import HealthChecker
 
         mock_shell = MagicMock()
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_shell.run.return_value = mock_result
+        link_result = MagicMock()
+        link_result.returncode = 0
+        link_result.stdout = "tun0 UP 198.18.0.1/15"
+        probe_result = MagicMock()
+        probe_result.returncode = 0
+        probe_result.stdout = "200"
+        # First call is the tun0 link check, second is the SOCKS probe.
+        mock_shell.run.side_effect = [link_result, probe_result, link_result, probe_result]
 
         checker = HealthChecker(
             shell=mock_shell,

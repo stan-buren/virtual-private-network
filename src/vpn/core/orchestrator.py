@@ -7,8 +7,12 @@ services. The orchestrator only knows *when* to call what, not *how*.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import shlex
+import socket
 import time
+from urllib.parse import urlsplit
 
 from vpn.core.events import EventType, VpnEvent
 from vpn.core.firewall.mss import MssClamp
@@ -178,6 +182,220 @@ class VpnOrchestrator:
         logger.info("[7/7] Bootstrap complete — posting BOOTSTRAP_DONE")
         await events.put(VpnEvent(EventType.BOOTSTRAP_DONE))
 
+
+    # ── Liveness verification and the recovery ladder ─────────────────────
+
+    VERIFY_TARGETS = ("https://www.google.com", "https://www.cloudflare.com")
+
+    async def verify_tunnel(self, timeout: int = 8) -> bool:
+        """Return True only when traffic really flows through sing-box.
+
+        The device state is the cheapest discriminator, and the probe runs
+        through the SOCKS inbound so a tun0 that silently lost its carrier
+        cannot be mistaken for a working tunnel (the kernel would otherwise
+        fall back to the physical uplink and a plain curl would still succeed).
+
+        Args:
+            timeout: Per-probe curl timeout in seconds.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._verify_tunnel_sync, timeout)
+
+    def _verify_tunnel_sync(self, timeout: int) -> bool:
+        link = self._shell.run("ip -br link show tun0 2>/dev/null", capture=True)
+        fields = (link.stdout or "").split() if link is not None else []
+        if len(fields) < 2 or fields[1] != "UP":
+            logger.warning(
+                "Tunnel verification: tun0 is not UP (%r)",
+                (link.stdout or "").strip() if link is not None else "",
+            )
+            return False
+        host = self._tunnel_cfg.socks5_host
+        port = self._tunnel_cfg.socks5_port
+        for url in self.VERIFY_TARGETS:
+            result = self._shell.run(
+                "curl -s -o /dev/null -w '%%{http_code}' --max-time %d "
+                "--socks5-hostname %s:%d %s"
+                % (timeout, host, port, url),
+                capture=True,
+                timeout=timeout + 2,
+            )
+            code = (result.stdout or "").strip() if result is not None else ""
+            if (
+                result is not None
+                and result.returncode == 0
+                and code.isdigit()
+                and code != "000"
+            ):
+                logger.info("Tunnel verification OK: %s -> HTTP %s", url, code)
+                return True
+        logger.warning(
+            "Tunnel verification failed: no probe through SOCKS %s:%d", host, port
+        )
+        return False
+
+    async def restart_and_verify(self, ctx: RuntimeContext) -> bool:
+        """Restart both tunnel processes with the current config, then verify."""
+        await self.restart_tunnel(ctx)
+        return await self.verify_tunnel()
+
+    async def rotate_and_restart(self, ctx: RuntimeContext, limit: int = 4) -> bool:
+        """Switch to a reachable provider node, restart and verify it.
+
+        Candidates are TCP-probed before selection: switching to an endpoint
+        that cannot be connected to is what turns a recovery into another
+        blackhole.
+        """
+        try:
+            servers = self._provider.list_servers()
+        except Exception:
+            logger.exception("Rotation: cannot list provider servers")
+            return False
+
+        current = self._current_outbound_tag()
+        tried = 0
+        loop = asyncio.get_running_loop()
+        for server in servers:
+            if server.tag == current:
+                continue
+            if tried >= limit:
+                break
+            tried += 1
+            reachable = await loop.run_in_executor(
+                None, self._tcp_reachable, server.host, server.port
+            )
+            if not reachable:
+                logger.warning(
+                    "Rotation: %s (%s:%s) is unreachable, skipping",
+                    server.name,
+                    server.host,
+                    server.port,
+                )
+                continue
+            logger.info(
+                "Rotation: switching to %s (%s, %s:%s)",
+                server.name,
+                server.country,
+                server.host,
+                server.port,
+            )
+            try:
+                config = self._provider.build_singbox_config(server.name)
+                with open(
+                    self._paths.get("sing_box_config", "/etc/sing-box/config.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    handle.write(config)
+                ctx.active_server = server.name
+                await self.restart_tunnel(ctx)
+            except Exception:
+                logger.exception("Rotation: failed to switch to %s", server.name)
+                continue
+            if await self.verify_tunnel():
+                logger.info("Rotation: %s is carrying traffic", server.name)
+                return True
+            logger.warning("Rotation: %s did not carry traffic", server.name)
+        logger.error("Rotation: no reachable node produced a working tunnel")
+        return False
+
+    async def refresh_and_restart(self, ctx: RuntimeContext) -> bool:
+        """Download a fresh subscription, redeploy, restart and verify.
+
+        The subscription is fetched *directly*: it is what has to repair a dead
+        tunnel, so it cannot depend on that tunnel being alive. A temporary
+        bypass rule pins the provider host to the main table for the download.
+        """
+        from vpn.adapters.system.filesystem import FilesystemAdapter
+        from vpn.config.config_loader import get_subscription_config
+        from vpn.config.paths import PROJECT_ROOT, load_paths_config
+        from vpn.core.subscription import SubscriptionError, SubscriptionUpdater
+
+        try:
+            url = get_subscription_config().url
+        except Exception:
+            logger.exception("Subscription config unavailable")
+            return False
+        if not url:
+            logger.error("No subscription URL configured")
+            return False
+
+        host = urlsplit(url).hostname
+        if host:
+            try:
+                for info in socket.getaddrinfo(host, None):
+                    self._rules.add_server_bypass(info[4][0])
+            except Exception:
+                logger.warning(
+                    "Could not pin a direct route to subscription host %s",
+                    host,
+                    exc_info=True,
+                )
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: self._shell.run(
+                "curl -fsSL -m 45 %s" % shlex.quote(url),
+                capture=True,
+                timeout=60,
+            ),
+        )
+        if result is None or result.returncode != 0:
+            logger.error(
+                "Subscription download failed (curl exit %s)",
+                None if result is None else result.returncode,
+            )
+            return False
+
+        try:
+            paths = load_paths_config(PROJECT_ROOT)
+        except Exception:
+            paths = self._paths
+        target = str(PROJECT_ROOT / paths.get("profile_keys", "data/profile.json"))
+        legacy = [
+            str(PROJECT_ROOT / "data" / "profile_keys_*.json"),
+            str(PROJECT_ROOT / "data" / "profile*.json"),
+        ]
+        fs = FilesystemAdapter()
+        try:
+            baseline = fs.read_json(str(PROJECT_ROOT / "config" / "singbox_baseline.json"))
+        except Exception:
+            baseline = {}
+        try:
+            summary = SubscriptionUpdater(fs, target, legacy, baseline).apply(result.stdout)
+        except SubscriptionError:
+            logger.exception("Subscription payload rejected")
+            return False
+        logger.info(
+            "Subscription refreshed: %s servers", summary.get("server_count")
+        )
+        self._deployer.deploy()
+        await self.restart_tunnel(ctx)
+        return await self.verify_tunnel()
+
+    def _tcp_reachable(self, host: str, port: int, timeout: float = 2.5) -> bool:
+        """Return True when a TCP connection to *host*:*port* succeeds."""
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def _current_outbound_tag(self) -> str | None:
+        """Return the outbound tag sing-box is currently pinned to."""
+        try:
+            with open(
+                self._paths.get("sing_box_config", "/etc/sing-box/config.json"),
+                encoding="utf-8",
+            ) as handle:
+                data = json.load(handle)
+        except Exception:
+            return None
+        for outbound in data.get("outbounds", []):
+            if outbound.get("tag") == "urltest_out":
+                return outbound.get("default")
+        return None
 
     async def teardown_network(self) -> None:
         """Emergency teardown — remove ALL VPN networking modifications.

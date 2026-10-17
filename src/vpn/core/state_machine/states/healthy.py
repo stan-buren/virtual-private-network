@@ -21,6 +21,11 @@ class HealthyState(VpnState):
     async def on_enter(self) -> None:
         logger.info("Entering HEALTHY state — VPN tunnel operational")
         self.ctx.fail_streak = 0
+        # A healthy tunnel ends the outage: the next failure gets a full
+        # recovery budget instead of inheriting an exhausted one and dropping
+        # straight to FAILED (and a container restart) on the first hiccup.
+        self.ctx.recovery_count = 0
+        self.ctx.last_error = None
         notifier = self.machine._notifier
         if notifier:
             loop = asyncio.get_running_loop()

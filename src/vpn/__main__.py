@@ -158,6 +158,10 @@ async def _main() -> None:
         orchestrator=orchestrator,
     )
 
+    # The health config owns the failure threshold; the state machine reads it
+    # from the shared runtime context.
+    machine.context.fail_threshold = health_cfg.fail_threshold
+
     # Bootstrap is triggered by BootstrappingState.on_enter() — no external task needed
 
     # ── Start signal handlers ─────────────────────────────────────────────
