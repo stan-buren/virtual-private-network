@@ -160,11 +160,11 @@ class VpnStateMachine:
         result = self._switcher.switch(name, restart_service=False)
         ctx = self.context
         await self._orchestrator.restart_tunnel(ctx)
-        profile_path = self._paths.get("profile_keys", "")
-        server_ips = self._resolver.resolve_all(profile_path, self._shell)
-        self._rules.clear_server_bypasses()
-        for ip in server_ips:
-            self._rules.add_server_bypass(ip)
+        # restart_tunnel already re-asserts the full policy routing. Doing it
+        # here too would be worse than redundant: a partial re-add of the
+        # server bypasses was exactly what left the catch-all missing after a
+        # switch, so a broken tunnel stayed broken through every rotation.
+        self._orchestrator.ensure_routing(ctx)
         ctx.active_server = name
         return result
 

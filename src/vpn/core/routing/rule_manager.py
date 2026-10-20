@@ -53,7 +53,10 @@ class RuleManager:
     def add_lan_bypass(self, subnet: str, priority: int) -> None:
         """Route a LAN subnet through table main."""
         self._shell.run(
-            "ip rule add to %s table main priority %d 2>/dev/null || true" % (subnet, priority)
+            "while ip rule del priority %d 2>/dev/null; do :; done" % priority
+        )
+        self._shell.run(
+            "ip rule add to %s table main priority %d" % (subnet, priority)
         )
         logger.info("LAN bypass: %s -> table main (priority %d)", subnet, priority)
 
@@ -67,12 +70,41 @@ class RuleManager:
         )
         logger.info("Torrent bypass: fwmark 1 -> table main (priority %d)", PRIO_TORRENT)
 
-    def add_catchall(self, table_id: str) -> None:
-        """Add catch-all rule routing all remaining traffic into the VPN table."""
+    def add_catchall(self, table_id: str) -> bool:
+        """Route all remaining traffic into *table_id* and prove it landed.
+
+        Idempotent: a stale rule at the catch-all priority is removed first, so
+        a recovered host never ends up pointing at an old table.  The result is
+        read back instead of assumed: a silently missing catch-all is exactly
+        what leaves the host sending everything out of the physical uplink while
+        the tunnel itself looks perfectly healthy.
+
+        Returns:
+            True when a rule into *table_id* is present after the call.
+        """
         self._shell.run(
-            "ip rule add from all table %s priority %d 2>/dev/null || true" % (table_id, PRIO_CATCHALL)
+            "while ip rule del priority %d 2>/dev/null; do :; done" % PRIO_CATCHALL
         )
-        logger.info("Catch-all: all traffic -> table %s (priority %d)", table_id, PRIO_CATCHALL)
+        self._shell.run(
+            "ip rule add from all table %s priority %d" % (table_id, PRIO_CATCHALL)
+        )
+        if not self.has_catchall(table_id):
+            logger.error(
+                "Catch-all rule into table %s was NOT installed (priority %d)",
+                table_id,
+                PRIO_CATCHALL,
+            )
+            return False
+        logger.info(
+            "Catch-all: all traffic -> table %s (priority %d)", table_id, PRIO_CATCHALL
+        )
+        return True
+
+    def has_catchall(self, table_id: str) -> bool:
+        """Return True when unmatched traffic is routed into *table_id*."""
+        result = self._shell.run("ip rule show", capture=True)
+        text = (result.stdout or "") if result is not None else ""
+        return ("lookup %s" % table_id) in text or ("table %s" % table_id) in text
 
     def clear_all(self) -> None:
         """Remove all known priority rules (1-30), handling duplicates.

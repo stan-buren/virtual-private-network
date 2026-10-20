@@ -83,7 +83,7 @@ class TestOrchestratorRestartTunnel:
     """Tests for the shared restart path used by recovery and server switches."""
 
     @pytest.mark.asyncio
-    async def test_restart_replaces_processes_and_keeps_routing(self) -> None:
+    async def test_restart_replaces_processes_and_reasserts_routing(self) -> None:
         ctx = RuntimeContext()
         watcher = MagicMock()
         tun2socks = MagicMock()
@@ -101,8 +101,13 @@ class TestOrchestratorRestartTunnel:
         orch._tun.destroy.assert_called_once()
         orch._tun.create.assert_called_once()
         # Deleting tun0 drops its default route from table 100 - re-assert it.
-        orch._route_table.set_default.assert_called_once_with("100")
-        # Policy rules and bypasses are reused: no rule teardown happens here.
+        orch._route_table.set_default.assert_any_call("100")
+        # The rule set is kernel state that a netplan apply, an interface
+        # reconfiguration or a DHCP renewal wipes silently. A restart that only
+        # respawns processes recreates a tunnel nobody's traffic enters, so the
+        # catch-all has to be proven again on every restart.
+        orch._rules.add_catchall.assert_called_with("100")
+        # The destructive teardown path stays bootstrap-only.
         orch._rules.clear_all.assert_not_called()
         orch._route_table.flush.assert_not_called()
 

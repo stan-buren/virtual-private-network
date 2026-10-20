@@ -28,6 +28,7 @@ def _orch(shell, provider=None, paths=None) -> VpnOrchestrator:
     orch._provider = provider or MagicMock()
     orch._paths = paths if paths is not None else {}
     orch._tunnel_cfg = SimpleNamespace(socks5_host="127.0.0.1", socks5_port=3066)
+    orch._app_cfg = SimpleNamespace(table_id="100")
     orch._rules = MagicMock()
     orch._deployer = MagicMock()
     return orch

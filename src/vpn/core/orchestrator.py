@@ -132,35 +132,11 @@ class VpnOrchestrator:
         # 4. Routing
         logger.info("[4/7] Configuring routing")
         self._tun.create()
-
-        profile_path = self._paths.get("profile_keys", "")
-        server_ips = self._resolver.resolve_all(profile_path, self._shell)
-
-        for ip in server_ips:
-            self._rules.add_server_bypass(ip)
-
-        for i, dns_ip in enumerate(self._net_cfg.dns_servers):
-            self._rules.add_dns_bypass(dns_ip, priority=PRIO_DNS_START + i)
-
-        for i, subnet in enumerate(self._net_cfg.lan_subnets):
-            self._rules.add_lan_bypass(subnet, priority=PRIO_LAN_START + i)
-
-        ru_cache_path = self._paths.get("ru_subnets", "cache/ru-subnets.txt")
-        routes = self._bypass_loader.load_all(
-            ru_cache_path=ru_cache_path,
-            bypass_domains=self._bypass_cfg.domains,
-            bypass_subnets=self._bypass_cfg.subnets,
-            vpn_domains=self._vpn_routes_cfg.domains,
-            vpn_wildcards=self._vpn_routes_cfg.wildcards,
-            vpn_subnets=self._vpn_routes_cfg.subnets,
-            gateway=topology.gateway,
-            interface=topology.interface,
-            table_id=self._app_cfg.table_id,
-        )
-        self._route_table.load_batch(routes, self._app_cfg.table_id)
-        self._rules.add_catchall(self._app_cfg.table_id)
-        self._route_table.set_default(self._app_cfg.table_id)
-        self._rules.add_torrent_bypass()
+        if not self.ensure_routing(ctx, reload_routes=True):
+            logger.error(
+                "Policy routing could not be asserted — host traffic will not "
+                "enter the tunnel even though the SOCKS inbound is up"
+            )
         await asyncio.sleep(0)  # Yield
 
         # 5. Firewall
@@ -182,6 +158,94 @@ class VpnOrchestrator:
         logger.info("[7/7] Bootstrap complete — posting BOOTSTRAP_DONE")
         await events.put(VpnEvent(EventType.BOOTSTRAP_DONE))
 
+    # ── Policy routing: the single source of truth ────────────────────────
+
+    BATCH_ROUTE_MIN = 100
+
+    def ensure_routing(self, ctx: RuntimeContext, reload_routes: bool = False) -> bool:
+        """(Re)assert the complete policy-routing state; safe to call repeatedly.
+
+        Bootstrap, a server switch and every recovery rung must finish here.
+        The ip rules and the table-100 routes are plain kernel state: a netplan
+        apply, an interface reconfiguration or a DHCP lease renewal wipes them
+        without a trace, and the SOCKS inbound keeps answering while the host
+        sends every packet out of the physical uplink.
+
+        Args:
+            ctx: Runtime context carrying the discovered topology.
+            reload_routes: Force a reload of the bypass route batch even when
+                the table still looks populated (used by a fresh bootstrap).
+
+        Returns:
+            True when the catch-all rule is in place, i.e. host traffic can
+            actually reach the tunnel.
+        """
+        table_id = self._app_cfg.table_id
+        profile_path = self._paths.get("profile_keys", "")
+        server_ips = self._resolver.resolve_all(profile_path, self._shell)
+
+        self._rules.clear_server_bypasses()
+        for ip in server_ips:
+            self._rules.add_server_bypass(ip)
+
+        for i, dns_ip in enumerate(self._net_cfg.dns_servers):
+            self._rules.add_dns_bypass(dns_ip, priority=PRIO_DNS_START + i)
+
+        for i, subnet in enumerate(self._net_cfg.lan_subnets):
+            self._rules.add_lan_bypass(subnet, priority=PRIO_LAN_START + i)
+
+        self._rules.add_torrent_bypass()
+        self._route_table.set_default(table_id)
+        self._ensure_bypass_routes(ctx, force=reload_routes)
+
+        ok = self._rules.add_catchall(table_id)
+        if ok:
+            logger.info(
+                "Policy routing asserted: %d server bypasses, table %s, %d routes",
+                len(server_ips),
+                table_id,
+                self._routing_route_count(table_id),
+            )
+        return ok
+
+    def _routing_route_count(self, table_id: str) -> int:
+        """Return how many routes are currently present in *table_id*."""
+        result = self._shell.run("ip route show table %s" % table_id, capture=True)
+        text = (result.stdout or "") if result is not None else ""
+        return len([line for line in text.splitlines() if line.strip()])
+
+    def _ensure_bypass_routes(self, ctx: RuntimeContext, force: bool = False) -> None:
+        """Reload the table-100 route batch when it is missing or forced.
+
+        The batch carries the RU bypass subnets and the per-domain VPN routes.
+        Losing it is survivable but wrong: without it every destination,
+        including domestic ones, exits through the provider.
+        """
+        table_id = self._app_cfg.table_id
+        if not force and self._routing_route_count(table_id) >= self.BATCH_ROUTE_MIN:
+            return
+        if not ctx.gateway or not ctx.interface:
+            logger.warning(
+                "Bypass route batch not reloaded: topology unknown "
+                "(gateway=%r interface=%r)",
+                ctx.gateway,
+                ctx.interface,
+            )
+            return
+        ru_cache_path = self._paths.get("ru_subnets", "cache/ru-subnets.txt")
+        routes = self._bypass_loader.load_all(
+            ru_cache_path=ru_cache_path,
+            bypass_domains=self._bypass_cfg.domains,
+            bypass_subnets=self._bypass_cfg.subnets,
+            vpn_domains=self._vpn_routes_cfg.domains,
+            vpn_wildcards=self._vpn_routes_cfg.wildcards,
+            vpn_subnets=self._vpn_routes_cfg.subnets,
+            gateway=ctx.gateway,
+            interface=ctx.interface,
+            table_id=table_id,
+        )
+        self._route_table.load_batch(routes, table_id)
+        logger.info("Bypass route batch loaded: %d entries", len(routes))
 
     # ── Liveness verification and the recovery ladder ─────────────────────
 
@@ -208,6 +272,14 @@ class VpnOrchestrator:
             logger.warning(
                 "Tunnel verification: tun0 is not UP (%r)",
                 (link.stdout or "").strip() if link is not None else "",
+            )
+            return False
+        if not self._rules.has_catchall(self._app_cfg.table_id):
+            logger.warning(
+                "Tunnel verification: no rule routes traffic into table %s — the "
+                "SOCKS inbound answers but the host exits through the physical "
+                "uplink",
+                self._app_cfg.table_id,
             )
             return False
         host = self._tunnel_cfg.socks5_host
@@ -486,6 +558,10 @@ class VpnOrchestrator:
             # Re-assert the default route: deleting tun0 drops it from table 100.
             self._route_table.set_default(self._app_cfg.table_id)
             self.start_tun2socks(ctx)
+            # Re-assert policy routing: the rule set is kernel state that a
+            # netplan apply or a DHCP lease renewal silently wipes, and a
+            # restart is the moment the host is expected to be whole again.
+            self.ensure_routing(ctx)
             ctx.startup_time = time.time()
             logger.info("Tunnel restart complete")
 

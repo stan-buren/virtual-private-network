@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from vpn.core.routing.route_table import RouteEntry, RouteTable
@@ -61,11 +62,18 @@ class TestRuleManager:
     # lan bypass
 
     def test_add_lan_bypass_calls_shell(self) -> None:
-        """Adding a LAN bypass issues a single ip rule add command."""
+        """Adding a LAN bypass clears the priority, then adds the rule.
+
+        The clear matters: a leftover rule at the same priority makes the add
+        fail with EEXIST, which is how a bypass disappears silently while its
+        log line still claims success.
+        """
         mock_shell = MagicMock()
         rm = RuleManager(mock_shell)
         rm.add_lan_bypass("192.168.0.0/16", priority=11)
-        assert mock_shell.run.call_count == 1
+        commands = [c.args[0] for c in mock_shell.run.call_args_list]
+        assert any("ip rule del priority 11" in c for c in commands)
+        assert any("ip rule add to 192.168.0.0/16 table main priority 11" in c for c in commands)
 
     # torrent bypass
 
@@ -79,11 +87,22 @@ class TestRuleManager:
     # catchall
 
     def test_add_catchall_calls_shell(self) -> None:
-        """Catch-all adds a single 'from all table <id>' rule."""
+        """Catch-all installs the rule and proves it is in the rule list."""
         mock_shell = MagicMock()
+        mock_shell.run.return_value = SimpleNamespace(
+            stdout="30:\tfrom all lookup 100\n", returncode=0
+        )
         rm = RuleManager(mock_shell)
-        rm.add_catchall("100")
-        mock_shell.run.assert_called_once()
+        assert rm.add_catchall("100") is True
+        commands = [c.args[0] for c in mock_shell.run.call_args_list]
+        assert any("ip rule add from all table 100 priority 30" in c for c in commands)
+
+    def test_add_catchall_reports_failure_when_rule_missing(self) -> None:
+        """A rule that never landed must not be reported as installed."""
+        mock_shell = MagicMock()
+        mock_shell.run.return_value = SimpleNamespace(stdout="", returncode=0)
+        rm = RuleManager(mock_shell)
+        assert rm.add_catchall("100") is False
 
     # clear methods
 
