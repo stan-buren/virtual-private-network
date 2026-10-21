@@ -12,6 +12,7 @@ import logging
 import os
 from typing import Any, Type
 
+from vpn.core import obs
 from vpn.core.events import EventType, VpnEvent
 from vpn.core.state_machine.context import RuntimeContext
 from vpn.core.state_machine.states.base import VpnState
@@ -38,7 +39,6 @@ class VpnStateMachine:
         paths: dict[str, str] | None = None,
         notifier: Any = None,
         orchestrator: Any = None,
-        health_checker: Any = None,
         watcher: Any = None,
         events: asyncio.Queue[VpnEvent] | None = None,
     ) -> None:
@@ -57,7 +57,6 @@ class VpnStateMachine:
         self._dns_resolver = dns_resolver
         self._notifier = notifier
         self._orchestrator = orchestrator
-        self._health_checker = health_checker
         self._watcher = watcher
         self._paths = paths or {}
         self._ipc_server: asyncio.AbstractServer | None = None
@@ -83,7 +82,6 @@ class VpnStateMachine:
         self._running = True
         await self.transition_to(self._initial_state_cls)
         await self._start_ipc()
-        self._start_background_tasks()
         logger.info("State machine running")
         while self._running:
             try:
@@ -104,22 +102,6 @@ class VpnStateMachine:
         self._background_tasks.clear()
         if self._watcher is not None:
             self._watcher.stop()
-
-    def _start_background_tasks(self) -> None:
-        """Start the daemon's long-running safety nets exactly once.
-
-        Without them a dead tunnel is never noticed (no death event reaches the
-        state machine) and a blackholed host is never recovered (no health
-        event reaches it either).
-        """
-        if self._health_checker is not None:
-            self._background_tasks.append(
-                asyncio.create_task(
-                    self._health_checker.run_forever(self._event_queue),
-                    name="health-checker",
-                )
-            )
-            logger.info("Connectivity health checker started")
 
     # ── IPC ───────────────────────────────────────────────────────────────
 
@@ -166,6 +148,7 @@ class VpnStateMachine:
         # switch, so a broken tunnel stayed broken through every rotation.
         self._orchestrator.ensure_routing(ctx)
         ctx.active_server = name
+        self._orchestrator.persist_active_server(name)
         return result
 
     async def _reload_config(self) -> dict:

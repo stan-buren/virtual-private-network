@@ -18,6 +18,8 @@ class AppConfig:
         provider: Name of the VPN provider adapter to use (e.g. 'akonit').
         sing_box_service: Name of the sing-box systemd service or process.
         unbound_service: Name of the unbound DNS resolver service.
+        active_server: Server to pin the config to. Empty means "resolve it
+            from the cache file written by `vpn server change`".
     """
 
     tag: str
@@ -26,6 +28,7 @@ class AppConfig:
     provider: str
     sing_box_service: str
     unbound_service: str
+    active_server: str = ""
 
     @classmethod
     def _from_yaml(cls) -> AppConfig:
@@ -50,4 +53,5 @@ class AppConfig:
             provider=app["provider"],
             sing_box_service=app["sing_box_service"],
             unbound_service=app["unbound_service"],
+            active_server=(app.get("active_server") or "").strip(),
         )

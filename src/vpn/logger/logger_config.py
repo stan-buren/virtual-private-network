@@ -41,3 +41,13 @@ def setup_logging(level: int = logging.INFO, use_json: bool = False) -> None:
         handler.setFormatter(formatter)
         logger.addHandler(handler)
         logger.propagate = False
+
+    # Structured events are written as bare JSON lines, so they can be parsed
+    # directly (jq, Loki, grep) without unwrapping the text formatter.
+    event_logger = logging.getLogger("vpn.event")
+    event_logger.setLevel(level)
+    if not event_logger.handlers:
+        event_handler = logging.StreamHandler(sys.stdout)
+        event_handler.setFormatter(logging.Formatter("%(message)s"))
+        event_logger.addHandler(event_handler)
+        event_logger.propagate = False

@@ -11,7 +11,6 @@ from functools import cache
 
 from vpn.config.core.app import AppConfig
 from vpn.config.core.bypass import BypassConfig
-from vpn.config.core.health import HealthConfig
 from vpn.config.core.network import NetworkConfig
 from vpn.config.core.notification import NotificationConfig
 from vpn.config.core.subscription import SubscriptionConfig
@@ -29,12 +28,6 @@ def get_app_config() -> AppConfig:
 def get_network_config() -> NetworkConfig:
     """Loads and returns the cached NetworkConfig singleton."""
     return NetworkConfig._from_yaml()
-
-
-@cache
-def get_health_config() -> HealthConfig:
-    """Loads and returns the cached HealthConfig singleton."""
-    return HealthConfig._from_yaml()
 
 
 @cache

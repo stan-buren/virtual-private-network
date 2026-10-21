@@ -9,11 +9,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import shlex
-import socket
+import os
 import time
-from urllib.parse import urlsplit
+from pathlib import Path
 
+from vpn.core import obs
 from vpn.core.events import EventType, VpnEvent
 from vpn.core.firewall.mss import MssClamp
 from vpn.core.firewall.nat import NatManager
@@ -35,6 +35,7 @@ from vpn.config.core.bypass import BypassConfig
 from vpn.config.core.network import NetworkConfig
 from vpn.config.core.tunnel import TunnelConfig
 from vpn.config.core.vpn_routes import VpnRoutesConfig
+from vpn.config.paths import PROJECT_ROOT
 
 logger = logging.getLogger("vpn")
 
@@ -99,64 +100,176 @@ class VpnOrchestrator:
         self._tunnel_lock = asyncio.Lock()
 
     async def bootstrap(self, ctx: RuntimeContext, events: asyncio.Queue[VpnEvent]) -> None:
-        """Execute the full bootstrap sequence.
+        """Bring the tunnel up once, pinned to one explicit server.
 
-        Steps:
-            1. Deploy sing-box config
-            2. Start sing-box + wait for SOCKS5 port
-            3. Discover network topology
-            4. Configure routing (TUN, bypasses, route table)
-            5. Apply firewall rules (NAT, MSS, sysctl)
-            6. Start tunnel and background tasks
-            7. Post BOOTSTRAP_DONE event
+        No probing, no rotation and no recovery: resolve the operator's chosen
+        server, deploy exactly that config, install routing and start the
+        processes. The daemon never picks a different node on its own.
         """
+        started = obs.now()
         logger.info("=== VPN Bootstrap Sequence ===")
+        obs.emit("SYS", "info", "bootstrap.start", cost="none")
 
-        # 0. Pre-bootstrap cleanup — remove leftovers from previous unclean shutdown
-        logger.info("[0/7] Pre-bootstrap cleanup")
+        # 0. Remove leftovers from an unclean shutdown.
         await self.teardown_network()
 
-        # 1. Deploy config
-        logger.info("[1/7] Deploying sing-box configuration")
-        self._deployer.deploy()
+        # 1. Resolve the operator's server and pin the config to it.
+        server = self._resolve_active_server()
+        ctx.active_server = server
+        step = obs.now()
+        if not self._pin_config_to_server(server):
+            obs.emit(
+                "CFG", "fail", "config.deploy", cost="none",
+                latency_ms=(obs.now() - step) * 1000,
+                error_class="config_deploy_failed", server=server,
+            )
+            raise VpnConnectionError("cannot deploy sing-box config for %r" % server)
+        obs.emit(
+            "CFG", "ok", "config.deploy", cost="none",
+            latency_ms=(obs.now() - step) * 1000, server=server,
+            config=self._paths.get("sing_box_config", "/etc/sing-box/config.json"),
+        )
 
-        # 2. Start sing-box (no port-wait — _watch_process catches failures)
-        logger.info("[2/7] Starting sing-box process")
+        # 2. sing-box
+        step = obs.now()
         self.start_singbox(ctx)
-        logger.debug("[2/7] sing-box process launched, proceeding to topology")
+        await self._wait_for_socks_port()
+        obs.emit(
+            "L0", "ok", "process.start", cost="none",
+            latency_ms=(obs.now() - step) * 1000, process="sing-box",
+            pid=getattr(ctx.singbox, "pid", None),
+        )
+
+        # 3. Topology
         topology = self._topology_discovery.discover()
         ctx.gateway = topology.gateway
         ctx.interface = topology.interface
-        await asyncio.sleep(0)  # Yield
+        obs.emit(
+            "SYS", "ok", "topology.discover", cost="none",
+            gateway=topology.gateway, interface=topology.interface,
+        )
 
         # 4. Routing
-        logger.info("[4/7] Configuring routing")
+        step = obs.now()
         self._tun.create()
-        if not self.ensure_routing(ctx, reload_routes=True):
-            logger.error(
-                "Policy routing could not be asserted — host traffic will not "
-                "enter the tunnel even though the SOCKS inbound is up"
-            )
-        await asyncio.sleep(0)  # Yield
+        routed = self.ensure_routing(ctx, reload_routes=True)
+        obs.emit(
+            "L2", "ok" if routed else "fail", "routing.assert",
+            cost="route-change", latency_ms=(obs.now() - step) * 1000,
+            error_class=None if routed else "catchall_missing",
+            routes=self._routing_route_count(self._app_cfg.table_id),
+        )
 
         # 5. Firewall
-        logger.info("[5/7] Applying firewall rules")
+        step = obs.now()
         self._nat.apply(topology.interface)
         self._mss.apply()
         self._sysctl_mgr.enable_ip_forward()
         self._sysctl_mgr.disable_ipv6_wan()
+        obs.emit(
+            "L2", "ok", "firewall.apply", cost="route-change",
+            latency_ms=(obs.now() - step) * 1000, interface=topology.interface,
+        )
 
-        # 6. Start tunnel + background tasks
-        logger.info("[6/7] Starting tunnel and background tasks")
+        # 6. tun2socks
+        step = obs.now()
         self.start_tun2socks(ctx)
         ctx.startup_time = time.time()
-        servers = self._provider.list_servers()
-        ctx.active_server = servers[0].name if servers else "unknown"
+        obs.emit(
+            "L0", "ok", "process.start", cost="none",
+            latency_ms=(obs.now() - step) * 1000, process="tun2socks",
+            pid=getattr(ctx.tun2socks, "pid", None),
+        )
+
         self._ru_updater_task = asyncio.create_task(self._ru_updater.run_forever())
 
-        # 7. Signal done
-        logger.info("[7/7] Bootstrap complete — posting BOOTSTRAP_DONE")
+        # 7. One verification, for the log only. It never changes anything.
+        step = obs.now()
+        ok = await self.verify_tunnel()
+        obs.emit(
+            "L1", "ok" if ok else "fail", "tunnel.verify", cost="none",
+            latency_ms=(obs.now() - step) * 1000,
+            error_class=None if ok else "no_traffic_through_socks",
+            server=server,
+        )
+
+        obs.emit(
+            "SYS", "ok", "bootstrap.done", cost="none",
+            latency_ms=(obs.now() - started) * 1000, server=server, verified=ok,
+        )
         await events.put(VpnEvent(EventType.BOOTSTRAP_DONE))
+
+    # ── Manual server selection ───────────────────────────────────────────
+
+    def _active_server_file(self) -> str:
+        """Path of the persisted manual selection."""
+        return str(
+            Path(PROJECT_ROOT) / self._paths.get("cache_dir", "cache") / "active_server"
+        )
+
+    def _resolve_active_server(self) -> str:
+        """Return the operator's server: cache file, then config, then warn."""
+        servers = {s.name for s in self._provider.list_servers()}
+        candidates: list[tuple[str, str]] = []
+        path = self._active_server_file()
+        try:
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as handle:
+                    candidates.append((handle.read().strip(), "cache"))
+        except OSError:
+            logger.warning("Cannot read %s", path, exc_info=True)
+        if self._app_cfg.active_server:
+            candidates.append((self._app_cfg.active_server.strip(), "config"))
+
+        for name, source in candidates:
+            if name and name in servers:
+                obs.emit("CFG", "ok", "server.resolve", server=name, source=source)
+                return name
+            if name:
+                obs.emit(
+                    "CFG", "warn", "server.resolve",
+                    error_class="unknown_server", server=name, source=source,
+                )
+
+        if not servers:
+            raise VpnConnectionError("provider profile has no servers")
+        fallback = sorted(servers)[0]
+        obs.emit(
+            "CFG", "warn", "server.resolve", error_class="no_active_server",
+            server=fallback, hint="run: vpn server change <name>",
+        )
+        return fallback
+
+    def _pin_config_to_server(self, name: str) -> bool:
+        """Write a sing-box config whose final outbound is exactly *name*."""
+        try:
+            config = self._provider.build_singbox_config(name)
+        except Exception:
+            logger.exception("Cannot build config for %s", name)
+            return False
+        dest = self._paths.get("sing_box_config", "/etc/sing-box/config.json")
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as handle:
+                handle.write(config)
+        except OSError:
+            logger.exception("Cannot write %s", dest)
+            return False
+        return True
+
+    def persist_active_server(self, name: str) -> None:
+        """Remember the operator's choice across container recreations."""
+        path = self._active_server_file()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(name.strip() + "\n")
+            obs.emit("CFG", "ok", "server.persist", server=name, path=path)
+        except OSError as exc:
+            obs.emit(
+                "CFG", "warn", "server.persist",
+                error_class="persist_failed", error=str(exc)[:200],
+            )
 
     # ── Policy routing: the single source of truth ────────────────────────
 
@@ -310,164 +423,6 @@ class VpnOrchestrator:
         """Restart both tunnel processes with the current config, then verify."""
         await self.restart_tunnel(ctx)
         return await self.verify_tunnel()
-
-    async def rotate_and_restart(self, ctx: RuntimeContext, limit: int = 4) -> bool:
-        """Switch to a reachable provider node, restart and verify it.
-
-        Candidates are TCP-probed before selection: switching to an endpoint
-        that cannot be connected to is what turns a recovery into another
-        blackhole.
-        """
-        try:
-            servers = self._provider.list_servers()
-        except Exception:
-            logger.exception("Rotation: cannot list provider servers")
-            return False
-
-        current = self._current_outbound_tag()
-        tried = 0
-        loop = asyncio.get_running_loop()
-        for server in servers:
-            if server.tag == current:
-                continue
-            if tried >= limit:
-                break
-            tried += 1
-            reachable = await loop.run_in_executor(
-                None, self._tcp_reachable, server.host, server.port
-            )
-            if not reachable:
-                logger.warning(
-                    "Rotation: %s (%s:%s) is unreachable, skipping",
-                    server.name,
-                    server.host,
-                    server.port,
-                )
-                continue
-            logger.info(
-                "Rotation: switching to %s (%s, %s:%s)",
-                server.name,
-                server.country,
-                server.host,
-                server.port,
-            )
-            try:
-                config = self._provider.build_singbox_config(server.name)
-                with open(
-                    self._paths.get("sing_box_config", "/etc/sing-box/config.json"),
-                    "w",
-                    encoding="utf-8",
-                ) as handle:
-                    handle.write(config)
-                ctx.active_server = server.name
-                await self.restart_tunnel(ctx)
-            except Exception:
-                logger.exception("Rotation: failed to switch to %s", server.name)
-                continue
-            if await self.verify_tunnel():
-                logger.info("Rotation: %s is carrying traffic", server.name)
-                return True
-            logger.warning("Rotation: %s did not carry traffic", server.name)
-        logger.error("Rotation: no reachable node produced a working tunnel")
-        return False
-
-    async def refresh_and_restart(self, ctx: RuntimeContext) -> bool:
-        """Download a fresh subscription, redeploy, restart and verify.
-
-        The subscription is fetched *directly*: it is what has to repair a dead
-        tunnel, so it cannot depend on that tunnel being alive. A temporary
-        bypass rule pins the provider host to the main table for the download.
-        """
-        from vpn.adapters.system.filesystem import FilesystemAdapter
-        from vpn.config.config_loader import get_subscription_config
-        from vpn.config.paths import PROJECT_ROOT, load_paths_config
-        from vpn.core.subscription import SubscriptionError, SubscriptionUpdater
-
-        try:
-            url = get_subscription_config().url
-        except Exception:
-            logger.exception("Subscription config unavailable")
-            return False
-        if not url:
-            logger.error("No subscription URL configured")
-            return False
-
-        host = urlsplit(url).hostname
-        if host:
-            try:
-                for info in socket.getaddrinfo(host, None):
-                    self._rules.add_server_bypass(info[4][0])
-            except Exception:
-                logger.warning(
-                    "Could not pin a direct route to subscription host %s",
-                    host,
-                    exc_info=True,
-                )
-
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: self._shell.run(
-                "curl -fsSL -m 45 %s" % shlex.quote(url),
-                capture=True,
-                timeout=60,
-            ),
-        )
-        if result is None or result.returncode != 0:
-            logger.error(
-                "Subscription download failed (curl exit %s)",
-                None if result is None else result.returncode,
-            )
-            return False
-
-        try:
-            paths = load_paths_config(PROJECT_ROOT)
-        except Exception:
-            paths = self._paths
-        target = str(PROJECT_ROOT / paths.get("profile_keys", "data/profile.json"))
-        legacy = [
-            str(PROJECT_ROOT / "data" / "profile_keys_*.json"),
-            str(PROJECT_ROOT / "data" / "profile*.json"),
-        ]
-        fs = FilesystemAdapter()
-        try:
-            baseline = fs.read_json(str(PROJECT_ROOT / "config" / "singbox_baseline.json"))
-        except Exception:
-            baseline = {}
-        try:
-            summary = SubscriptionUpdater(fs, target, legacy, baseline).apply(result.stdout)
-        except SubscriptionError:
-            logger.exception("Subscription payload rejected")
-            return False
-        logger.info(
-            "Subscription refreshed: %s servers", summary.get("server_count")
-        )
-        self._deployer.deploy()
-        await self.restart_tunnel(ctx)
-        return await self.verify_tunnel()
-
-    def _tcp_reachable(self, host: str, port: int, timeout: float = 2.5) -> bool:
-        """Return True when a TCP connection to *host*:*port* succeeds."""
-        try:
-            with socket.create_connection((host, port), timeout=timeout):
-                return True
-        except OSError:
-            return False
-
-    def _current_outbound_tag(self) -> str | None:
-        """Return the outbound tag sing-box is currently pinned to."""
-        try:
-            with open(
-                self._paths.get("sing_box_config", "/etc/sing-box/config.json"),
-                encoding="utf-8",
-            ) as handle:
-                data = json.load(handle)
-        except Exception:
-            return None
-        for outbound in data.get("outbounds", []):
-            if outbound.get("tag") == "urltest_out":
-                return outbound.get("default")
-        return None
 
     async def teardown_network(self) -> None:
         """Emergency teardown — remove ALL VPN networking modifications.

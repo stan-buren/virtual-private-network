@@ -19,9 +19,7 @@ from vpn.adapters.system.subprocess import SubprocessAdapter
 from vpn.config.config_loader import (
     get_app_config,
     get_bypass_config,
-    get_health_config,
     get_network_config,
-    get_notification_config,
     get_tunnel_config,
     get_vpn_routes_config,
 )
@@ -30,9 +28,7 @@ from vpn.core.events import EventType, VpnEvent
 from vpn.core.firewall.mss import MssClamp
 from vpn.core.firewall.nat import NatManager
 from vpn.core.firewall.sysctl import SysctlManager
-from vpn.core.health.checker import HealthChecker
 from vpn.core.health.process_watcher import ProcessWatcher
-from vpn.core.notification.telegram import TelegramNotifier
 from vpn.core.orchestrator import VpnOrchestrator
 from vpn.core.routing.bypass_loader import BypassLoader
 from vpn.core.routing.route_table import RouteTable
@@ -53,7 +49,7 @@ logger = logging.getLogger("vpn")
 
 async def _main() -> None:
     """Wire adapters, create services, start state machine."""
-    setup_logging(level=logging.DEBUG, use_json=False)
+    setup_logging(level=logging.INFO, use_json=False)
     logger.info("VPN Daemon starting — project root: %s", PROJECT_ROOT)
 
     # ── Load configs ──────────────────────────────────────────────────────
@@ -62,11 +58,9 @@ async def _main() -> None:
     SpeedtestStore(PROJECT_ROOT / paths.get("cache_dir", "cache")).clear()
     app_cfg = get_app_config()
     net_cfg = get_network_config()
-    health_cfg = get_health_config()
     tunnel_cfg = get_tunnel_config()
     bypass_cfg = get_bypass_config()
     vpn_routes_cfg = get_vpn_routes_config()
-    notify_cfg = get_notification_config()
 
     logger.info("App config: provider=%s, table=%s", app_cfg.provider, app_cfg.table_id)
 
@@ -98,14 +92,6 @@ async def _main() -> None:
     server_switcher = ServerSwitcher(
         provider, fs, shell, paths.get("sing_box_config", "/etc/sing-box/config.json")
     )
-    health_checker = HealthChecker(
-        shell,
-        targets=health_cfg.targets,
-        user_agents=health_cfg.user_agents,
-        interval_range=(health_cfg.check_interval_min, health_cfg.check_interval_max),
-        curl_timeout=health_cfg.curl_timeout,
-    )
-    telegram = TelegramNotifier()
     ru_updater = RuSubnetUpdater(
         fs, str(PROJECT_ROOT / paths.get("ru_subnets", "cache/ru-subnets.txt"))
     )
@@ -126,7 +112,7 @@ async def _main() -> None:
         sysctl_mgr=sysctl_mgr,
         tun2socks=tun2socks,
         provider=provider,
-        notifier=telegram,
+        notifier=None,
         ru_updater=ru_updater,
         watcher=watcher,
         shell=shell,
@@ -151,16 +137,11 @@ async def _main() -> None:
         vpn_routes_cfg=vpn_routes_cfg,
         dns_resolver=dns_resolver,
         paths=paths,
-        notifier=telegram,
+        notifier=None,
         events=events,
-        health_checker=health_checker,
         watcher=watcher,
         orchestrator=orchestrator,
     )
-
-    # The health config owns the failure threshold; the state machine reads it
-    # from the shared runtime context.
-    machine.context.fail_threshold = health_cfg.fail_threshold
 
     # Bootstrap is triggered by BootstrappingState.on_enter() — no external task needed
 
