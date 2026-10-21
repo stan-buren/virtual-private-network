@@ -182,6 +182,29 @@ class VpnOrchestrator:
         await events.put(VpnEvent(EventType.BOOTSTRAP_DONE))
 
 
+    def _wait_for_socks_port(self, timeout: int = 30) -> bool:
+        """Block until sing-box accepts connections on the SOCKS port.
+
+        A config reload replaces sing-box. Starting tun2socks before that
+        listener exists leaves the host pointing at a tunnel that refuses every
+        dial, so the reload must wait for the port instead of assuming it.
+
+        Returns:
+            True when the port listens within *timeout*, False otherwise.
+        """
+        port = self._tunnel_cfg.socks5_port
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            probe = self._shell.run(
+                "ss -ltnH 'sport = :%d' 2>/dev/null" % port, capture=True
+            )
+            if probe is not None and (probe.stdout or "").strip():
+                logger.info("SOCKS listener up on port %d", port)
+                return True
+            time.sleep(0.25)
+        logger.error("SOCKS port %d did not open within %ds", port, timeout)
+        return False
+
     async def teardown_network(self) -> None:
         """Emergency teardown — remove ALL VPN networking modifications.
 

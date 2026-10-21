@@ -129,6 +129,15 @@ class VpnStateMachine:
             "-c", "/etc/sing-box/config.json",
             "-D", "/var/lib/sing-box",
         ])
+        # The new sing-box needs a moment before it listens. Starting
+        # tun2socks against a closed port leaves the host blackholed, so the
+        # reload waits for 3066 and fails loudly instead of half-applying the
+        # profile that "vpn config update" just downloaded.
+        if not orch._wait_for_socks_port(timeout=30):
+            raise RuntimeError(
+                "sing-box did not open the SOCKS listener within 30s; "
+                "the profile was written but not applied"
+            )
         ctx.tun2socks = orch._tun2socks.start("socks5://127.0.0.1:3066")
         profile_path = self._paths.get("profile_keys", "")
         server_ips = self._resolver.resolve_all(profile_path, self._shell)
