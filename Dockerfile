@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
 RUN pip3 install --no-cache-dir click pyyaml python-dotenv
 
 # Install sing-box binary — version pinned to match provider config compatibility
-ARG SING_BOX_VERSION=1.12.17
+ARG SING_BOX_VERSION=1.14.4
 RUN curl -fsSL -o /tmp/sing-box.tar.gz \
     "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz" \
     && tar -xzf /tmp/sing-box.tar.gz -C /tmp \

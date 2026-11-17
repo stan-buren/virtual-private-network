@@ -11,6 +11,9 @@ services:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - /opt/vpn/cache:/app/cache
+      # Профиль подписки живёт на хосте: образ собирается из кэша и может
+      # принести старый data/profile.json, что уже случалось.
+      - ./data/profile.json:/app/data/profile.json
     env_file:
       - .env
     restart: unless-stopped
